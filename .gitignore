@@ -1,0 +1,38 @@
+# Build artifacts
+obj/
+qwen-moe
+test
+tools/prepare_experts
+tools/check_qkv_layout
+tools/compare_logits
+tools/test_matvec
+tools/verify_experts
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Model weights and expert stores (huge files)
+*.gguf
+*.qmoe
+
+# PPL resume checkpoints
+*.ckpt
+
+# Paper build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+
+# Core dumps
+core
+core.*
+experiments/
