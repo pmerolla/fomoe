@@ -928,6 +928,7 @@ struct gpu_ctx {
         int batch_eid[16];
         int batch_n;
         int batch_max;  // max reads per dispatch (default 4, env QMOE_BACKFILL_N)
+        bool sync_mode; // deterministic mode: once-per-token, blocking (env QMOE_BACKFILL_SYNC)
 
         // Resources (set at init, read-only after)
         nvme_io_t   *nvme_io;
@@ -2908,6 +2909,64 @@ static void backfill_try_complete(gpu_ctx_t *ctx) {
     pthread_mutex_unlock(&bf.mutex);
 }
 
+// Deterministic backfill: dispatch exactly batch_max experts and block until done.
+// Called once per token (after layer loop), ensures identical cache evolution
+// regardless of NVMe bandwidth.
+static void backfill_dispatch_sync(gpu_ctx_t *ctx) {
+    auto &bf = ctx->backfill;
+    if (!bf.active || !bf.sync_mode) return;
+
+    // Wait for any in-flight work from previous call to complete
+    pthread_mutex_lock(&bf.mutex);
+    while (!bf.work_done && !bf.shutdown)
+        pthread_cond_wait(&bf.cond_done, &bf.mutex);
+    pthread_mutex_unlock(&bf.mutex);
+
+    // Commit previous batch results to RAM cache
+    backfill_try_complete(ctx);
+
+    if (bf.queue_count == 0) return;
+
+    // Dequeue up to batch_max entries
+    bf.batch_n = 0;
+    int removed = 0;
+    for (int i = 0; i < bf.queue_count && bf.batch_n < bf.batch_max; ) {
+        int layer = bf.queue_layer[i];
+        int eid = bf.queue_eid[i];
+        backfill_dedup_clear(ctx, layer, eid);
+        removed++;
+        if (bf.rcache->map[layer * bf.rcache->n_experts + eid] >= 0) {
+            bf.total_skipped++;
+            i++;
+            continue;
+        }
+        bf.batch_layer[bf.batch_n] = layer;
+        bf.batch_eid[bf.batch_n] = eid;
+        bf.batch_n++;
+        i++;
+    }
+    if (removed > 0 && removed < bf.queue_count) {
+        memmove(bf.queue_layer, bf.queue_layer + removed, (bf.queue_count - removed) * sizeof(int));
+        memmove(bf.queue_eid, bf.queue_eid + removed, (bf.queue_count - removed) * sizeof(int));
+        memmove(bf.queue_ratio, bf.queue_ratio + removed, (bf.queue_count - removed) * sizeof(float));
+    }
+    bf.queue_count -= removed;
+
+    if (bf.batch_n == 0) return;
+
+    // Signal worker and block until all reads complete
+    pthread_mutex_lock(&bf.mutex);
+    bf.work_ready = true;
+    bf.work_done = false;
+    pthread_cond_signal(&bf.cond_work);
+    while (!bf.work_done && !bf.shutdown)
+        pthread_cond_wait(&bf.cond_done, &bf.mutex);
+    pthread_mutex_unlock(&bf.mutex);
+
+    // Commit results to RAM cache immediately
+    backfill_try_complete(ctx);
+}
+
 // ---- Bounce buffer memcpy worker ----
 // Copies scattered RAM cache slots to contiguous bounce buffer in background.
 // Main thread can do hipEventSync/rcache_pop_wait while this runs.
@@ -4631,6 +4690,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
         if (bf_n > 16) bf_n = 16;
         ctx->backfill.batch_max = bf_n;
         ctx->backfill.no_priority = (getenv("QMOE_NO_PRIORITY_BACKFILL") != nullptr);
+        ctx->backfill.sync_mode = (getenv("QMOE_BACKFILL_SYNC") != nullptr);
         // Dedup bitmap: 1 bit per (layer, expert) pair
         ctx->backfill.dedup_n_experts = ctx->n_experts_total;
         size_t dedup_bits = (size_t)ctx->n_layers * ctx->n_experts_total;
@@ -4647,8 +4707,9 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
             pthread_cond_init(&ctx->backfill.cond_done, nullptr);
             ctx->backfill.active = true;
             pthread_create(&ctx->backfill.thread, nullptr, backfill_worker_fn, ctx);
-            fprintf(stderr, "GPU: CAR backfill worker started (batch=%d, queue=%d, dedup=%zuKB)\n",
-                    bf_n, 512, dedup_words * 8 / 1024);
+            fprintf(stderr, "GPU: CAR backfill worker started (batch=%d, queue=%d, dedup=%zuKB%s)\n",
+                    bf_n, 512, dedup_words * 8 / 1024,
+                    ctx->backfill.sync_mode ? ", SYNC: once-per-token" : "");
         } else {
             fprintf(stderr, "GPU: CAR backfill buffer alloc failed, disabled\n");
             for (int i = 0; i < bf_n; i++) { free(ctx->backfill.buffers[i]); ctx->backfill.buffers[i] = nullptr; }
@@ -5542,7 +5603,9 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
 
         // Commit any completed backfill reads to RAM cache (non-blocking check).
         // This runs during the attention/SSM sync stall, so it's free.
-        backfill_try_complete(ctx);
+        // In sync mode, backfill_dispatch_sync handles commit once per token.
+        if (!ctx->backfill.sync_mode)
+            backfill_try_complete(ctx);
 
         // Note: Spec NVMe prefetch was tested but adds NVMe latency to critical
         // path that exceeds the VRAM hit rate improvement. The spec worker does
@@ -6107,7 +6170,9 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
 
         // Dispatch backfill reads — NVMe will be idle during the next
         // layer's attention/SSM phase, so these reads don't contend.
-        backfill_dispatch(ctx);
+        // In sync mode, backfill runs once per token after the layer loop.
+        if (!ctx->backfill.sync_mode)
+            backfill_dispatch(ctx);
 
         // === Relay d_x to next layer's GPU ===
         // After this layer's output residual, d_x is on device d.
@@ -6136,6 +6201,9 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
     }
 
     ctx->prefetch.has_prev = true;
+
+    // Deterministic backfill: exactly batch_max experts, once per token
+    backfill_dispatch_sync(ctx);
 
     // ---- Final output: LM head ----
     int last_d = (max_layers_gpu - 1) & 1;
