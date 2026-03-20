@@ -40,8 +40,8 @@ https://github.com/user-attachments/assets/54c39239-32aa-4db4-b53e-c97acd79e555
 |-----------|------|-----:|
 | 2x AMD RX 9060 XT | 16 GB VRAM each, RDNA 4 | $1,000 |
 | DDR5 RAM | 32 GB | $330 |
-| NVMe Gen5 SSD | 1 TB (~14.5 GB/s read) | $200 |
-| X870E motherboard | PCIe 5.0 x8/x8 bifurcation | $300 |
+| NVMe Gen5 SSD | 1 TB (14.5 GB/s read) | $200 |
+| Taichi lite X870E motherboard | PCIe 5.0 x8/x8 | $300 |
 | AMD Ryzen 5 7600X 6-Core | 12 cores | $180 |
 | PSU | 850W | $90 |
 | **Total** | | **$2,100** |
@@ -207,6 +207,8 @@ VRAM hits refresh DRAM expert cache timestamps, so when an expert is evicted fro
 
 CAR alone has a cache divergence problem: substituted experts never get loaded, so the cache drifts from what the router actually wants. A background thread loads substituted experts from NVMe into DRAM during idle I/O windows (the attention phase, when NVMe is idle), prioritizing experts where substitution quality was poorest (most needed). Next token, it's a DRAM hit instead of another substitution. In experiments, **reduces CAR's perplexity overhead by up to 80% at zero throughput cost.**
 
+Closing this distribution gap further is ripe for future work. One direction is to explicitly track the divergence between the router's true expert distribution and the cache-biased distribution, and use this signal to drive cache eviction and backfill priority.
+  
 ### Warmup
 
 `QMOE_CAR_WARMUP=N` forces CAR=1.0 (no substitutions) for the first N tokens. During warmup, all experts load from NVMe, seeding the VRAM and DRAM caches with real expert data. After warmup, CAR activates with a hot cache. This can be used in conjunction or to replace frequency seeding.
