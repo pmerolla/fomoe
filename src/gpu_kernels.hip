@@ -433,6 +433,42 @@ void cpu_expert_get_timing(cpu_expert_ctx_t *ctx, double *avg_wakeup_us,
 #define MAX_N_EXPERTS_TOTAL 512
 #define MAX_LAYERS 256
 
+// ---- Routing trace format (QMOE_TRACE_FILE) ----
+#define TRACE_MAGIC   0x54524345  // "TRCE"
+#define TRACE_VERSION 1
+
+enum {
+    TRACE_SRC_VRAM    = 0,
+    TRACE_SRC_RAM     = 1,
+    TRACE_SRC_NVME    = 2,
+    TRACE_SRC_CAR     = 3,
+    TRACE_SRC_DROPPED = 4,
+};
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint16_t n_layers;
+    uint16_t n_experts_total;
+    uint16_t top_k;
+    uint16_t reserved;
+    uint64_t reserved2;
+    uint64_t reserved3;
+} trace_header_t;  // 32 bytes
+
+typedef struct __attribute__((packed)) {
+    uint32_t token_id;
+    uint16_t layer_id;
+    uint8_t  n_used;
+    uint8_t  n_substitutions;
+    int16_t  orig_ids[MAX_EXPERTS];
+    float    orig_scores[MAX_EXPERTS];
+    int16_t  final_ids[MAX_EXPERTS];
+    float    final_scores[MAX_EXPERTS];
+    uint8_t  source[MAX_EXPERTS];
+    uint8_t  pad[6];
+} trace_record_t;  // 144 bytes (top_k=10)
+
 // ---- Per-layer GPU weight storage ----
 
 struct gpu_layer {
@@ -943,6 +979,14 @@ struct gpu_ctx {
         uint64_t total_dropped;
         uint64_t total_deduped;
     } backfill;
+
+    // Routing trace (QMOE_TRACE_FILE)
+    struct {
+        FILE    *fp;
+        uint8_t *buf;
+        size_t   buf_used;
+        size_t   buf_cap;
+    } trace;
 };
 
 // Forward declaration for spec routing worker thread
@@ -4609,6 +4653,29 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
     if (ctx->no_cold_fetch)
         fprintf(stderr, "GPU: no-cold-fetch mode (NVMe only via async prefetch)\n");
 
+    // --- Routing trace ---
+    memset(&ctx->trace, 0, sizeof(ctx->trace));
+    {
+        const char *trace_path = getenv("QMOE_TRACE_FILE");
+        if (trace_path && trace_path[0]) {
+            ctx->trace.fp = fopen(trace_path, "wb");
+            if (ctx->trace.fp) {
+                ctx->trace.buf_cap = 256 * 1024;
+                ctx->trace.buf = (uint8_t *)malloc(ctx->trace.buf_cap);
+                trace_header_t hdr = {};
+                hdr.magic = TRACE_MAGIC;
+                hdr.version = TRACE_VERSION;
+                hdr.n_layers = (uint16_t)ctx->n_layers;
+                hdr.n_experts_total = (uint16_t)ctx->n_experts_total;
+                hdr.top_k = (uint16_t)ctx->n_experts_used;
+                fwrite(&hdr, sizeof(hdr), 1, ctx->trace.fp);
+                fprintf(stderr, "GPU: routing trace enabled -> %s\n", trace_path);
+            } else {
+                fprintf(stderr, "GPU: warning: cannot open trace file %s\n", trace_path);
+            }
+        }
+    }
+
     // --- Initialize CAR (v2 module) ---
     {
         const char *env = getenv("QMOE_CAR_THRESHOLD");
@@ -5745,7 +5812,9 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
         // Snapshot original expert IDs before CAR modifies them in-place.
         // Used for (1) correct frequency counting and (2) backfill enqueue.
         int orig_expert_ids[16];
+        float orig_expert_scores[16];
         memcpy(orig_expert_ids, dc->h_top_k_ids, n_used * sizeof(int));
+        memcpy(orig_expert_scores, dc->h_top_k_vals, n_used * sizeof(float));
 
         // Cache-aware routing (substitution)
         // During warmup, skip CAR so all experts load from NVMe (seeds the cache)
@@ -5812,6 +5881,7 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
         }
 
         // No-cold-fetch: drop remaining uncached
+        int pre_ncf_n_uncached = n_uncached;
         if (ctx->no_cold_fetch && n_uncached > 0) {
             for (int u = 0; u < n_uncached; u++)
                 dc->h_top_k_vals[uncached_stg[u]] = 0.0f;
@@ -5823,6 +5893,42 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
             }
             ctx->prof.cold_fetch_dropped += n_uncached;
             n_uncached = 0;
+        }
+
+        // Routing trace: emit per-layer record
+        if (ctx->trace.fp) {
+            trace_record_t rec;
+            memset(&rec, 0, sizeof(rec));
+            rec.token_id = (uint32_t)ctx->prof.token_count;
+            rec.layer_id = (uint16_t)il;
+            rec.n_used = (uint8_t)n_used;
+            int n_subs = 0;
+            for (int i = 0; i < n_used; i++) {
+                rec.orig_ids[i] = (int16_t)orig_expert_ids[i];
+                rec.orig_scores[i] = orig_expert_scores[i];
+                rec.final_ids[i] = (int16_t)dc->h_top_k_ids[i];
+                rec.final_scores[i] = dc->h_top_k_vals[i];
+                if (orig_expert_ids[i] != dc->h_top_k_ids[i]) n_subs++;
+            }
+            rec.n_substitutions = (uint8_t)n_subs;
+            for (int j = 0; j < n_cached; j++)
+                rec.source[cached_stg[j]] = TRACE_SRC_VRAM;
+            for (int j = 0; j < n_ramhit; j++)
+                rec.source[ramhit_stg[j]] = TRACE_SRC_RAM;
+            for (int j = 0; j < pre_ncf_n_uncached; j++)
+                rec.source[uncached_stg[j]] = TRACE_SRC_NVME;
+            for (int i = 0; i < n_used; i++) {
+                if (orig_expert_ids[i] != dc->h_top_k_ids[i])
+                    rec.source[i] = TRACE_SRC_CAR;
+                else if (dc->h_top_k_vals[i] == 0.0f)
+                    rec.source[i] = TRACE_SRC_DROPPED;
+            }
+            if (ctx->trace.buf_used + sizeof(rec) > ctx->trace.buf_cap) {
+                fwrite(ctx->trace.buf, 1, ctx->trace.buf_used, ctx->trace.fp);
+                ctx->trace.buf_used = 0;
+            }
+            memcpy(ctx->trace.buf + ctx->trace.buf_used, &rec, sizeof(rec));
+            ctx->trace.buf_used += sizeof(rec);
         }
 
         // Build ordered expert pointers for FFN
@@ -7640,6 +7746,15 @@ extern "C" void gpu_free(gpu_ctx_t *ctx) {
 
     // Expert frequency counter
     free(ctx->expert_freq);
+
+    // Flush and close routing trace
+    if (ctx->trace.fp) {
+        if (ctx->trace.buf_used > 0)
+            fwrite(ctx->trace.buf, 1, ctx->trace.buf_used, ctx->trace.fp);
+        fclose(ctx->trace.fp);
+        free(ctx->trace.buf);
+        ctx->trace.fp = nullptr;
+    }
 
     // Expert VRAM cache (v2 module)
     (void)hipFree(ctx->ecache.d_buf);
