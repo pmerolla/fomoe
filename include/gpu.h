@@ -56,6 +56,15 @@ const uint32_t *gpu_get_expert_freq(gpu_ctx_t *ctx);
 // Get n_layers and n_experts for interpreting the freq array.
 void gpu_get_expert_dims(gpu_ctx_t *ctx, int *n_layers, int *n_experts);
 
+// Get cumulative ping-pong relay stats since this GPU context was created.
+// For single-GPU or non-ping-pong runs, all outputs are zero.
+void gpu_get_pingpong_relay_stats(gpu_ctx_t *ctx,
+                                  uint64_t *handoffs,
+                                  uint64_t *payload_bytes,
+                                  uint64_t *d2h_bytes,
+                                  uint64_t *h2d_bytes,
+                                  uint64_t *dma_bytes);
+
 // Dispatch batched expert FFN to GPU (legacy, still used by gpu_forward internally)
 // Returns 0 on success, -1 to fall back to CPU
 int gpu_expert_ffn(gpu_ctx_t *ctx,
