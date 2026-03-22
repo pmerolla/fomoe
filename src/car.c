@@ -204,7 +204,12 @@ int car_evaluate(
 
         int idx = cand->idx;
         expert_ids[idx] = cand->best_eid;
-        expert_scores[idx] = cand->best_score;
+        // When dampening is enabled (skip_renorm), scale the substitute's score
+        // by the ratio to limit hidden state perturbation. A 50%-quality substitute
+        // gets 50% of the original weight, reducing drift accumulation.
+        expert_scores[idx] = car->skip_renorm
+            ? expert_scores[idx] * cand->ratio   // dampen: orig_score * ratio
+            : cand->best_score;                   // default: full substitute score
 
         car->substitutions++;
         car->nvme_avoided++;
