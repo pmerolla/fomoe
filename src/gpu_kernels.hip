@@ -5862,17 +5862,17 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
                     uncached_ids[u] = dc->h_top_k_ids[uncached_stg[u]];
 
                 // Enqueue substituted originals for background NVMe backfill.
-                // Priority = score ratio (lower = worse substitution = load first).
+                // Priority = original router score (higher = more wanted = load first).
                 if (ctx->backfill.active) {
                     for (int i = 0; i < n_used; i++) {
                         if (orig_expert_ids[i] != dc->h_top_k_ids[i]) {
-                            float ratio = 1.0f;
+                            float priority = 0.0f;
                             if (!ctx->backfill.no_priority) {
                                 float s_orig = dc->h_all_scores[orig_expert_ids[i]];
-                                float s_sub = dc->h_all_scores[dc->h_top_k_ids[i]];
-                                ratio = (s_orig > 0.0f) ? s_sub / s_orig : 0.0f;
+                                // Negate so highest scores sort to front of ascending queue.
+                                priority = -s_orig;
                             }
-                            backfill_enqueue(ctx, il, orig_expert_ids[i], ratio);
+                            backfill_enqueue(ctx, il, orig_expert_ids[i], priority);
                         }
                     }
                 }
