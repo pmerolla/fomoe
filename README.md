@@ -22,8 +22,8 @@ https://github.com/user-attachments/assets/54c39239-32aa-4db4-b53e-c97acd79e555
 | Mode | tok/s | PPL |
 |------|------:|-----|
 | Baseline (no expert substitution) | **5.1** | baseline |
-| FOMOE (low substitution) | **6.5** | +4.0% |
-| FOMOE (moderate substitution) | **8.8** | +8.2% |
+| FOMOE (low substitution) | **6.5** | +3.2% |
+| FOMOE (moderate substitution) | **8.8** | +8.0% |
 
 > Single-user, single-batch generation. PPL on WikiText (coldstart, warmup=512).
 
@@ -188,7 +188,7 @@ CAR threshold    tok/s    PPL overhead
 0.35 (rec.)       8.8     +8.2%
 ```
 
-> PPL measured on WikiText with 40 chunks (10K tokens), coldstart, warmup=512.
+> PPL measured on WikiText with 40 chunks (10K tokens), coldstart, warmup=512. Please note perplexity using CAR depends on the system setup and backfill rate achieved by the nvme. Making CAR deterministic across nvme speeds is wip.
 
 ### Three-tier cache
 
