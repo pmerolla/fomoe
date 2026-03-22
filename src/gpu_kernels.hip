@@ -7578,6 +7578,9 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
 extern "C" void gpu_reset_state(gpu_ctx_t *ctx) {
     if (!ctx || !ctx->model_uploaded) return;
 
+    // Reset token counter so warmup re-activates for each ppl chunk
+    ctx->prof.token_count = 0;
+
     // Drain backfill worker: wait for any in-flight NVMe reads to finish,
     // then flush the queue (stale entries from the previous chunk).
     if (ctx->backfill.active) {
