@@ -945,7 +945,7 @@ struct gpu_ctx {
         bool            shutdown;
 
         // Priority queue of pending backfill requests (capacity = 512)
-        // Sorted by score_ratio ascending: worst substitutions backfilled first.
+        // Sorted ascending: uses negated router score so highest-scored experts load first.
         // Set no_priority=true for FIFO ordering (QMOE_NO_PRIORITY_BACKFILL=1).
         int queue_layer[512];
         int queue_eid[512];
@@ -960,17 +960,17 @@ struct gpu_ctx {
         int       dedup_n_experts;  // n_experts_total, for indexing
 
         // Work batch (dequeued for current background cycle)
-        int batch_layer[16];
-        int batch_eid[16];
+        int batch_layer[64];
+        int batch_eid[64];
         int batch_n;
-        int batch_max;  // max reads per dispatch (default 4, env QMOE_BACKFILL_N)
+        int batch_max;  // max reads per dispatch (default 4, env QMOE_BACKFILL_N, max 64)
         bool sync_mode; // deterministic mode: once-per-token, blocking (env QMOE_BACKFILL_SYNC)
 
         // Resources (set at init, read-only after)
         nvme_io_t   *nvme_io;
         ram_cache_t *rcache;
         uint64_t     expert_stride;
-        void        *buffers[16];  // page-aligned NVMe read buffers
+        void        *buffers[64];  // page-aligned NVMe read buffers
 
         // Stats
         uint64_t total_backfilled;
@@ -2790,7 +2790,7 @@ static void *backfill_worker_fn(void *arg) {
         if (bf.shutdown) { pthread_mutex_unlock(&bf.mutex); break; }
 
         int n = bf.batch_n;
-        int b_layer[16], b_eid[16];
+        int b_layer[64], b_eid[64];
         memcpy(b_layer, bf.batch_layer, n * sizeof(int));
         memcpy(b_eid, bf.batch_eid, n * sizeof(int));
         bf.work_ready = false;
@@ -2839,7 +2839,7 @@ static inline void backfill_dedup_clear(gpu_ctx_t *ctx, int layer, int eid) {
 }
 
 // Enqueue a substituted expert for background backfill (main thread only).
-// Maintains a priority queue sorted by score_ratio ascending (worst subs first).
+// Maintains a priority queue sorted ascending (negated router score: highest-scored experts first).
 static void backfill_enqueue(gpu_ctx_t *ctx, int layer, int expert_id, float score_ratio) {
     auto &bf = ctx->backfill;
     if (!bf.active) return;
@@ -2850,7 +2850,7 @@ static void backfill_enqueue(gpu_ctx_t *ctx, int layer, int expert_id, float sco
         bf.total_deduped++;
         return;
     }
-    // If queue full, only insert if worse than the current worst (last entry)
+    // If queue full, only insert if higher priority than the lowest (last entry)
     if (bf.queue_count >= 512) {
         if (score_ratio >= bf.queue_ratio[bf.queue_count - 1]) {
             bf.total_dropped++;
@@ -2889,7 +2889,7 @@ static void backfill_dispatch(gpu_ctx_t *ctx) {
         return;
     }
 
-    // Dequeue from front (lowest ratio = worst substitutions = highest priority)
+    // Dequeue from front (most negative = highest router score = highest priority)
     bf.batch_n = 0;
     int removed = 0;
     for (int i = 0; i < bf.queue_count && bf.batch_n < bf.batch_max; ) {
@@ -4754,7 +4754,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
         const char *bf_env = getenv("QMOE_BACKFILL_N");
         int bf_n = bf_env ? atoi(bf_env) : 4;
         if (bf_n < 1) bf_n = 1;
-        if (bf_n > 16) bf_n = 16;
+        if (bf_n > 64) bf_n = 64;
         ctx->backfill.batch_max = bf_n;
         ctx->backfill.no_priority = (getenv("QMOE_NO_PRIORITY_BACKFILL") != nullptr);
         ctx->backfill.sync_mode = (getenv("QMOE_BACKFILL_SYNC") != nullptr);
