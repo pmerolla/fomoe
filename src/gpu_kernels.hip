@@ -838,6 +838,17 @@ struct gpu_ctx {
         // GPU1 expert engine stats
         int gpu1_expert_count;      // experts computed on GPU1
         double gpu1_wait_ms;        // CPU blocking on GPU1 event sync
+        // Ping-pong inter-GPU relay stats (logical GPU0<->GPU1 handoff)
+        uint64_t pp_relay_handoffs;      // number of layer-to-layer relay operations
+        uint64_t pp_relay_payload_bytes; // logical hidden-state bytes forwarded GPU->GPU
+        uint64_t pp_relay_d2h_bytes;     // actual D2H bytes via pinned host relay
+        uint64_t pp_relay_h2d_bytes;     // actual H2D bytes via pinned host relay
+        uint64_t pp_relay_dma_bytes;     // total DMA bytes = D2H + H2D
+        uint64_t pp_total_relay_handoffs;      // cumulative layer-to-layer relay operations
+        uint64_t pp_total_relay_payload_bytes; // cumulative logical hidden-state bytes
+        uint64_t pp_total_relay_d2h_bytes;     // cumulative D2H bytes via pinned host relay
+        uint64_t pp_total_relay_h2d_bytes;     // cumulative H2D bytes via pinned host relay
+        uint64_t pp_total_relay_dma_bytes;     // cumulative total DMA bytes = D2H + H2D
     } prof;
 
     // Expert frequency counting (for profile generation)
@@ -1906,7 +1917,13 @@ static __device__ __forceinline__ int dp4a_s8(int a, int b, int c) {
 #ifdef QMOE_CUDA
     return __dp4a(a, b, c);
 #else
-    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
+    const uint32_t ua = (uint32_t)a;
+    const uint32_t ub = (uint32_t)b;
+    return c
+        + (int8_t)(ua & 0xffu) * (int8_t)(ub & 0xffu)
+        + (int8_t)((ua >> 8) & 0xffu) * (int8_t)((ub >> 8) & 0xffu)
+        + (int8_t)((ua >> 16) & 0xffu) * (int8_t)((ub >> 16) & 0xffu)
+        + (int8_t)((ua >> 24) & 0xffu) * (int8_t)((ub >> 24) & 0xffu);
 #endif
 }
 
@@ -5011,6 +5028,26 @@ extern "C" void gpu_get_expert_dims(gpu_ctx_t *ctx, int *n_layers, int *n_expert
     if (n_experts) *n_experts = ctx->n_experts_total;
 }
 
+extern "C" void gpu_get_pingpong_relay_stats(gpu_ctx_t *ctx,
+                                              uint64_t *handoffs,
+                                              uint64_t *payload_bytes,
+                                              uint64_t *d2h_bytes,
+                                              uint64_t *h2d_bytes,
+                                              uint64_t *dma_bytes) {
+    if (handoffs) *handoffs = 0;
+    if (payload_bytes) *payload_bytes = 0;
+    if (d2h_bytes) *d2h_bytes = 0;
+    if (h2d_bytes) *h2d_bytes = 0;
+    if (dma_bytes) *dma_bytes = 0;
+    if (!ctx || !ctx->pingpong || ctx->n_devices < 2) return;
+
+    if (handoffs) *handoffs = ctx->prof.pp_total_relay_handoffs;
+    if (payload_bytes) *payload_bytes = ctx->prof.pp_total_relay_payload_bytes;
+    if (d2h_bytes) *d2h_bytes = ctx->prof.pp_total_relay_d2h_bytes;
+    if (h2d_bytes) *h2d_bytes = ctx->prof.pp_total_relay_h2d_bytes;
+    if (dma_bytes) *dma_bytes = ctx->prof.pp_total_relay_dma_bytes;
+}
+
 // ============================================================
 // Helper: queue attention/SSM + residual + router on GPU stream
 // All work is async — returns immediately after kernel launches.
@@ -5589,6 +5626,11 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
     ctx->prof.cpu_expert_count = 0;
     ctx->prof.gpu1_expert_count = 0;
     ctx->prof.gpu1_wait_ms = 0;
+    ctx->prof.pp_relay_handoffs = 0;
+    ctx->prof.pp_relay_payload_bytes = 0;
+    ctx->prof.pp_relay_d2h_bytes = 0;
+    ctx->prof.pp_relay_h2d_bytes = 0;
+    ctx->prof.pp_relay_dma_bytes = 0;
     memset(ctx->spec_valid, 0, sizeof(ctx->spec_valid));
     memset(ctx->spec2_valid, 0, sizeof(ctx->spec2_valid));
     memset(ctx->spec_nvme_n, 0, sizeof(ctx->spec_nvme_n));
@@ -6286,6 +6328,18 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
         if (il + 1 < max_layers_gpu) {
             int next_d = 1 - d;
             gpu_dev_t *next_dc = &ctx->dev[next_d];
+            size_t relay_bytes = (size_t)n_embd * sizeof(float);
+
+            ctx->prof.pp_relay_handoffs++;
+            ctx->prof.pp_relay_payload_bytes += relay_bytes;
+            ctx->prof.pp_relay_d2h_bytes += relay_bytes;
+            ctx->prof.pp_relay_h2d_bytes += relay_bytes;
+            ctx->prof.pp_relay_dma_bytes += relay_bytes * 2;
+            ctx->prof.pp_total_relay_handoffs++;
+            ctx->prof.pp_total_relay_payload_bytes += relay_bytes;
+            ctx->prof.pp_total_relay_d2h_bytes += relay_bytes;
+            ctx->prof.pp_total_relay_h2d_bytes += relay_bytes;
+            ctx->prof.pp_total_relay_dma_bytes += relay_bytes * 2;
 
             // D2H: device d -> pinned host (use h_gpu1_norm as relay buffer)
             // Use event-based sync instead of CPU-blocking hipStreamSynchronize
@@ -6388,6 +6442,8 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
             "    CAR:      %d subs, %d NVMe avoided, %d remaining, %d dropped\n"
             "    SpecRoute: %d/%d predicted (%.1f%%)\n"
             "    Prefetch:  %d experts (RAM→VRAM cross-GPU)\n"
+            "    Relay:     %llu hops, %.1f KiB payload, %.1f KiB DMA"
+            " (%.1f KiB D2H + %.1f KiB H2D)\n"
             "    Backfill:  %llu queued, %llu loaded, %llu deduped, %llu skipped, %llu dropped\n"
             "  Output:     %7.2f ms\n",
             ctx->prof.token_count, pos, n_layers, total, wall_ms, 1000.0 / wall_ms,
@@ -6415,6 +6471,11 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
             ctx->prof.spec_hits, ctx->prof.spec_total,
             ctx->prof.spec_total > 0 ? 100.0 * ctx->prof.spec_hits / ctx->prof.spec_total : 0.0,
             ctx->prof.vram_prefetched,
+            (unsigned long long)ctx->prof.pp_relay_handoffs,
+            (double)ctx->prof.pp_relay_payload_bytes / 1024.0,
+            (double)ctx->prof.pp_relay_dma_bytes / 1024.0,
+            (double)ctx->prof.pp_relay_d2h_bytes / 1024.0,
+            (double)ctx->prof.pp_relay_h2d_bytes / 1024.0,
             (unsigned long long)ctx->backfill.total_queued,
             (unsigned long long)ctx->backfill.total_backfilled,
             (unsigned long long)ctx->backfill.total_deduped,

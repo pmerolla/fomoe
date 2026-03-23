@@ -555,6 +555,27 @@ int main(int argc, char **argv) {
         if (gen_count > 0) {
             fprintf(stderr, "  Speed:         %.2f tokens/s (generation only)\n", gen_count / gen_time);
         }
+#ifdef QMOE_GPU
+        if (model->gpu_ctx) {
+            uint64_t relay_hops = 0, relay_payload = 0, relay_d2h = 0, relay_h2d = 0, relay_dma = 0;
+            gpu_get_pingpong_relay_stats(model->gpu_ctx,
+                                         &relay_hops,
+                                         &relay_payload,
+                                         &relay_d2h,
+                                         &relay_h2d,
+                                         &relay_dma);
+            if (relay_hops > 0) {
+                fprintf(stderr,
+                        "  Relay total:   %llu hops, %.2f MiB payload, %.2f MiB DMA"
+                        " (%.2f MiB D2H + %.2f MiB H2D)\n",
+                        (unsigned long long)relay_hops,
+                        (double)relay_payload / (1024.0 * 1024.0),
+                        (double)relay_dma / (1024.0 * 1024.0),
+                        (double)relay_d2h / (1024.0 * 1024.0),
+                        (double)relay_h2d / (1024.0 * 1024.0));
+            }
+        }
+#endif
 
         free(all_tokens);
         free(tokens);
