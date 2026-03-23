@@ -95,15 +95,9 @@ open('wiki.test.raw','w').write('\n'.join(ds['text']))
 ```
 
 ```bash
-# Evaluate perplexity (WikiText, coldstart)
-QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=512 \
-  ./qwen-moe ppl --ram-cache 16000 --ppl-ctx 512 --ppl-chunks 40 \
-  model.gguf store1.qmoe [store2.qmoe] -- @wiki.test.raw
-```
-
-```bash
-# Resumable perplexity (saves per-chunk NLL to checkpoint file)
-QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=512 \
+# Evaluate perplexity (WikiText, coldstart, deterministic)
+QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=256 \
+  QMOE_CAR_DAMPEN=1 QMOE_BACKFILL_N=28 QMOE_BACKFILL_SYNC=1 \
   ./qwen-moe ppl --ram-cache 16000 --ppl-ctx 512 --ppl-chunks 40 \
   --ppl-resume ppl.ckpt \
   model.gguf store1.qmoe [store2.qmoe] -- @wiki.test.raw
@@ -125,7 +119,9 @@ QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=512 \
 | `QMOE_CAR_WARMUP=N` | CAR=1.0 for first N tokens to seed cache |
 | `QMOE_PREFETCH_BUDGET=N` | NVMe prefetch budget (0 recommended for 397B) |
 | `QMOE_DEBUG=N` | 0=silent, 1=per-token stats, 2=per-layer detail |
-| `QMOE_BACKFILL_N=N` | Backfill batch size per dispatch (1-16, default 4) |
+| `QMOE_CAR_DAMPEN=1` | Scale substitute weights by score ratio to reduce drift |
+| `QMOE_BACKFILL_N=N` | Backfill batch size per dispatch (1-64, default 4) |
+| `QMOE_BACKFILL_SYNC=1` | Deterministic backfill: blocking, once per token |
 | `QMOE_NO_BACKFILL=1` | Disable background backfill |
 | `QMOE_PREV_PF=1` | Enable prev-token NVMe prefetch (experimental) |
 
