@@ -96,8 +96,11 @@ open('wiki.test.raw','w').write('\n'.join(ds['text']))
 
 ```bash
 # Evaluate perplexity (WikiText, coldstart, deterministic)
+# Sync backfill and prefetch budget=0 ensure consistent results
+# across setups with different NVMe speeds.
 QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=256 \
   QMOE_CAR_DAMPEN=1 QMOE_BACKFILL_N=28 QMOE_BACKFILL_SYNC=1 \
+  QMOE_PREFETCH_BUDGET=0 \
   ./qwen-moe ppl --ram-cache 16000 --ppl-ctx 512 --ppl-chunks 40 \
   --ppl-resume ppl.ckpt \
   model.gguf store1.qmoe [store2.qmoe] -- @wiki.test.raw
