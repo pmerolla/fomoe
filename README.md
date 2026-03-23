@@ -22,10 +22,9 @@ https://github.com/user-attachments/assets/54c39239-32aa-4db4-b53e-c97acd79e555
 | Mode | tok/s | PPL |
 |------|------:|-----|
 | Baseline (no expert substitution) | **5.1** | baseline |
-| FOMOE (low substitution) | **6.5** | +3.2% |
-| FOMOE (moderate substitution) | **8.8** | +8.0% |
+| FOMOE (moderate substitution) | **8.8** | +3.5% |
 
-> Single-user, single-batch generation. PPL on WikiText (coldstart, warmup=512).
+> Single-user, single-batch generation 256 tokens. PPL on WikiText (coldstart, warmup=256 per chunk).
 
 ---
 
@@ -40,7 +39,7 @@ https://github.com/user-attachments/assets/54c39239-32aa-4db4-b53e-c97acd79e555
 |-----------|------|-----:|
 | 2x AMD RX 9060 XT | 16 GB VRAM each, RDNA 4 | $1,000 |
 | DDR5 RAM | 32 GB | $330 |
-| NVMe Gen5 SSD | 1 TB (14.5 GB/s read) | $200 |
+| Crucial 710 NVMe | 1 TB (14.5 GB/s read) | $200 |
 | Taichi lite X870E motherboard | PCIe 5.0 x8/x8 | $300 |
 | AMD Ryzen 5 7600X 6-Core | 12 cores | $180 |
 | PSU | 850W | $90 |
@@ -153,9 +152,9 @@ QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=512 \
 
 MoE models are sparse. Qwen3.5-397B activates only 10 of 512 experts per layer, but you still need all 218 GB of expert weights (at Q4_K_M) accessible at low latency. RAM and VRAM are too expensive. The fallback is NVMe, but naive offloading hits a wall:
 
-**You can't read experts until the router picks them, and you can't compute until they arrive.** Across 60 layers these stalls compound. Pure NVMe streaming tops out at ~0.5 tok/s, and even with perfect bandwidth utilization the ceiling is ~3 tok/s on a top-of-the-line Gen5 drive.
+**You can't read experts until the router picks them, and you can't compute until they arrive.** Across 60 layers these stalls compound. Pure NVMe streaming is <1 tok/s even on a top-of-the-line Gen5 drive.
 
-We break through this ceiling by making most expert reads unnecessary.
+We break through this ceiling by making most expert reads from NVMe unnecessary.
 
 ---
 
@@ -184,11 +183,10 @@ This is smooth and tunable — higher $\tau$ means only very close substitutes a
 CAR threshold    tok/s    PPL overhead
 ───────────────────────────────────────
 1.00 (off)        5.1     baseline
-0.50              6.5     +4.0%
-0.35 (rec.)       8.8     +8.2%
+0.35 (rec.)       8.8     +3.5%
 ```
 
-> PPL measured on WikiText with 40 chunks (10K tokens), coldstart, warmup=512. Please note perplexity using CAR depends on the system setup and backfill rate achieved by the nvme. Making CAR deterministic across nvme speeds is wip.
+> PPL measured on WikiText with 40 chunks (10K tokens), coldstart, warmup=256. Please note perplexity using CAR currently depends on memory bandwidth and backfill rates. Making CAR deterministic is wip and QMOE_BACKFILL_SYNC=1 and QMOE_BACKFILL_N is a step in that direction.
 
 ### Three-tier cache
 
@@ -205,10 +203,10 @@ VRAM hits refresh DRAM expert cache timestamps, so when an expert is evicted fro
 
 ### Background backfill
 
-CAR alone has a cache divergence problem: substituted experts never get loaded, so the cache drifts from what the router actually wants. A background thread loads substituted experts from NVMe into DRAM during idle I/O windows (the attention phase, when NVMe is idle), prioritizing experts where substitution quality was poorest (most needed). Next token, it's a DRAM hit instead of another substitution. In experiments, **reduces CAR's perplexity overhead by up to 80% at zero throughput cost.**
+CAR alone has a cache divergence problem: substituted experts never get loaded, so the cache drifts from what the router actually wants. A background thread loads substituted experts from NVMe into DRAM during idle I/O windows (the attention phase, when NVMe is idle), prioritizing experts with the highest router scores. Next token, it's a DRAM hit instead of another substitution. In experiments, backfill **reduces CAR's perplexity overhead by up to 80% at zero throughput cost.**
 
-Closing this distribution gap further is ripe for future work. One direction is to explicitly track the divergence between the router's true expert distribution and the cache-biased distribution, and use this signal to drive cache eviction and backfill priority.
-  
+Closing this distribution gap is ripe for future work. One technique that helps seems to be dampening (QMOE_CAR_DAMPEN=1), which scales substituted expert weights by the score ratio. We hypothesize this reduces hidden state perturbations from substitutions, and limits the compounding drift.  
+
 ### Warmup
 
 `QMOE_CAR_WARMUP=N` forces CAR=1.0 (no substitutions) for the first N tokens. During warmup, all experts load from NVMe, seeding the VRAM and DRAM caches with real expert data. After warmup, CAR activates with a hot cache. This can be used in conjunction or to replace frequency seeding.
