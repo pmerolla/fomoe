@@ -70,7 +70,7 @@ Supports multiple drives with the same store file.
 
 ```bash
 # Interactive chat (recommended — warmup seeds cache from prompt)
-QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=0 \
+QMOE_PINGPONG=1 QMOE_CAR_THRESHOLD=0.35 QMOE_CAR_WARMUP=0 QMOE_CAR_DAMPEN=1 \
   ./qwen-moe chat --ram-cache 16000 --freq-profile 397b.freq \
   --max-tokens 128 --no-eos \
   model.gguf store1.qmoe [store2.qmoe]
