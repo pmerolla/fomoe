@@ -193,10 +193,10 @@ Expert usage is highly skewed where a small fraction of experts handle most toke
 
 | Tier | Capacity | Hit rate (CAR=1.0) | Hit rate (CAR=0.35) | Latency |
 |------|----------|----------|----------|---------|
-| VRAM (per-GPU) | 51+48 slots/layer | ~60% | ~47% | 0 ms (in-place) |
-| DRAM (pinned) | 36 slots/layer, 16 GB | ~12% | ~7% | ~0.2 ms H2D |
+| VRAM (per-GPU) | 51+48 slots/layer | ~60% | ~46% | 0 ms (in-place) |
+| DRAM (pinned) | 36 slots/layer, 16 GB | ~12% | ~6% | ~0.2 ms H2D |
 | CAR substitution | — | — | ~42% | 0 ms |
-| NVMe | Full 218 GB store | ~28% | ~7% | ~0.5 ms/expert |
+| NVMe | Full 218 GB store | ~28% | ~6% | ~0.5 ms/expert |
 
 VRAM hits refresh DRAM expert cache timestamps, so when an expert is evicted from VRAM, the DRAM copy is still fresh.
 
