@@ -2170,8 +2170,55 @@ __global__ void kernel_f16_matvec(
     if (row >= M) return;
 
     const __half *row_data = weight + (int64_t)row * K;
-    float sum = 0.0f;
-    for (int i = 0; i < K; i++)
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    int K4 = K >> 2;
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)input;
+    int i = 0;
+    for (; i + 3 < K4; i += 4) {
+        uint2 packed0 = row4[i + 0];
+        uint2 packed1 = row4[i + 1];
+        uint2 packed2 = row4[i + 2];
+        uint2 packed3 = row4[i + 3];
+        __half2 h01 = *(const __half2 *)&packed0.x;
+        __half2 h23 = *(const __half2 *)&packed0.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v0 = inp4[i + 0];
+        sum0 += w01.x * v0.x + w01.y * v0.y + w23.x * v0.z + w23.y * v0.w;
+
+        h01 = *(const __half2 *)&packed1.x;
+        h23 = *(const __half2 *)&packed1.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        float4 v1 = inp4[i + 1];
+        sum1 += w01.x * v1.x + w01.y * v1.y + w23.x * v1.z + w23.y * v1.w;
+
+        h01 = *(const __half2 *)&packed2.x;
+        h23 = *(const __half2 *)&packed2.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        float4 v2 = inp4[i + 2];
+        sum2 += w01.x * v2.x + w01.y * v2.y + w23.x * v2.z + w23.y * v2.w;
+
+        h01 = *(const __half2 *)&packed3.x;
+        h23 = *(const __half2 *)&packed3.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        float4 v3 = inp4[i + 3];
+        sum3 += w01.x * v3.x + w01.y * v3.y + w23.x * v3.z + w23.y * v3.w;
+    }
+    for (; i < K4; i++) {
+        uint2 packed = row4[i];
+        __half2 h01 = *(const __half2 *)&packed.x;
+        __half2 h23 = *(const __half2 *)&packed.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v = inp4[i];
+        sum0 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+    }
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int i = K4 << 2; i < K; i++)
         sum += __half2float(row_data[i]) * input[i];
     output[row] = sum;
 }
@@ -2197,8 +2244,39 @@ __global__ void kernel_f16_matvec_coop(
     if (row >= M) return;
 
     const __half *row_data = weight + (int64_t)row * K;
-    float partial = 0.0f;
-    for (int i = lane; i < K; i += 32)
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)s_input;
+    int K4 = K >> 2;
+    float partial0 = 0.0f, partial1 = 0.0f;
+    int i = lane;
+    for (; i + 32 < K4; i += 64) {
+        uint2 packed = row4[i];
+        __half2 h01 = *(const __half2 *)&packed.x;
+        __half2 h23 = *(const __half2 *)&packed.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v = inp4[i];
+        partial0 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+
+        packed = row4[i + 32];
+        h01 = *(const __half2 *)&packed.x;
+        h23 = *(const __half2 *)&packed.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        v = inp4[i + 32];
+        partial1 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+    }
+    for (; i < K4; i += 32) {
+        uint2 packed = row4[i];
+        __half2 h01 = *(const __half2 *)&packed.x;
+        __half2 h23 = *(const __half2 *)&packed.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v = inp4[i];
+        partial0 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+    }
+    float partial = partial0 + partial1;
+    for (int i = (K4 << 2) + lane; i < K; i += 32)
         partial += __half2float(row_data[i]) * s_input[i];
 
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -2218,8 +2296,60 @@ __global__ void kernel_bf16_matvec(
     if (row >= M) return;
 
     const uint16_t *row_data = weight + (int64_t)row * K;
-    float sum = 0.0f;
-    for (int i = 0; i < K; i++)
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    int K4 = K >> 2;
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)input;
+    int i = 0;
+    for (; i + 3 < K4; i += 4) {
+        uint2 packed = row4[i + 0];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v0 = inp4[i + 0];
+        sum0 += device_bf16_to_fp32(b0) * v0.x + device_bf16_to_fp32(b1) * v0.y
+             +  device_bf16_to_fp32(b2) * v0.z + device_bf16_to_fp32(b3) * v0.w;
+
+        packed = row4[i + 1];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        float4 v1 = inp4[i + 1];
+        sum1 += device_bf16_to_fp32(b0) * v1.x + device_bf16_to_fp32(b1) * v1.y
+             +  device_bf16_to_fp32(b2) * v1.z + device_bf16_to_fp32(b3) * v1.w;
+
+        packed = row4[i + 2];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        float4 v2 = inp4[i + 2];
+        sum2 += device_bf16_to_fp32(b0) * v2.x + device_bf16_to_fp32(b1) * v2.y
+             +  device_bf16_to_fp32(b2) * v2.z + device_bf16_to_fp32(b3) * v2.w;
+
+        packed = row4[i + 3];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        float4 v3 = inp4[i + 3];
+        sum3 += device_bf16_to_fp32(b0) * v3.x + device_bf16_to_fp32(b1) * v3.y
+             +  device_bf16_to_fp32(b2) * v3.z + device_bf16_to_fp32(b3) * v3.w;
+    }
+    for (; i < K4; i++) {
+        uint2 packed = row4[i];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v = inp4[i];
+        sum0 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+             +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+    }
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int i = K4 << 2; i < K; i++)
         sum += device_bf16_to_fp32(row_data[i]) * input[i];
     output[row] = sum;
 }
@@ -2245,8 +2375,42 @@ __global__ void kernel_bf16_matvec_coop(
     if (row >= M) return;
 
     const uint16_t *row_data = weight + (int64_t)row * K;
-    float partial = 0.0f;
-    for (int i = lane; i < K; i += 32)
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)s_input;
+    int K4 = K >> 2;
+    float partial0 = 0.0f, partial1 = 0.0f;
+    int i = lane;
+    for (; i + 32 < K4; i += 64) {
+        uint2 packed = row4[i];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v = inp4[i];
+        partial0 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+                 +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+
+        packed = row4[i + 32];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        v = inp4[i + 32];
+        partial1 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+                 +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+    }
+    for (; i < K4; i += 32) {
+        uint2 packed = row4[i];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v = inp4[i];
+        partial0 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+                 +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+    }
+    float partial = partial0 + partial1;
+    for (int i = (K4 << 2) + lane; i < K; i += 32)
         partial += device_bf16_to_fp32(row_data[i]) * s_input[i];
 
     for (int offset = 16; offset > 0; offset >>= 1)
