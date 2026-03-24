@@ -201,9 +201,11 @@ typedef struct {
     // Global weights
     void            *token_embd;
     enum ggml_dtype  token_embd_type;
+    size_t           token_embd_size;
     float           *output_norm;
     void            *output;
     enum ggml_dtype  output_type;
+    size_t           output_size;
 
     // Per-layer weights
     layer_weights_t *layers;
@@ -3499,8 +3501,8 @@ extern "C" gpu_ctx_t *gpu_init(void) {
     fprintf(stderr, "GPU: %s (%zu MB VRAM)\n",
             props.name, props.totalGlobalMem / (1024 * 1024));
 #ifdef QMOE_CUDA
-    fprintf(stderr, "GPU: sm_%d%d, SMs=%d, clock=%d MHz\n",
-            props.major, props.minor, props.multiProcessorCount, props.clockRate / 1000);
+    fprintf(stderr, "GPU: sm_%d%d, SMs=%d\n",
+            props.major, props.minor, props.multiProcessorCount);
 #else
     fprintf(stderr, "GPU: arch=%s, CUs=%d, clock=%d MHz\n",
             props.gcnArchName, props.multiProcessorCount, props.clockRate / 1000);
@@ -3654,7 +3656,16 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
     ctx->expert_intermediate = hp->expert_intermediate;
     ctx->shared_expert_intermediate = hp->shared_expert_intermediate;
     ctx->vocab_size = hp->vocab_size;
-    ctx->ctx_len = (hp->ctx_len > 4096) ? 4096 : hp->ctx_len;
+    ctx->ctx_len = hp->ctx_len;
+    {
+        const char *gpu_ctx_limit = getenv("QMOE_GPU_CTX_LIMIT");
+        if (gpu_ctx_limit && *gpu_ctx_limit) {
+            uint32_t limit = (uint32_t)atoi(gpu_ctx_limit);
+            if (limit > 0 && limit < ctx->ctx_len) ctx->ctx_len = limit;
+        } else if (ctx->ctx_len > 4096) {
+            ctx->ctx_len = 4096;
+        }
+    }
     ctx->rope_dim = hp->rope_dim;
     ctx->rope_freq_base = hp->rope_freq_base;
     ctx->rms_norm_eps = hp->rms_norm_eps;
@@ -3757,6 +3768,22 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 
     size_t total_uploaded = 0;
 
+    auto upload_bytes = [&](const void *src, void *dst, size_t total_bytes) -> int {
+        if (!src || !dst) {
+            fprintf(stderr, "GPU: upload_bytes null ptr src=%p dst=%p bytes=%zu\n", src, dst, total_bytes);
+            return -1;
+        }
+        const size_t chunk_bytes = 64ull * 1024ull * 1024ull;
+        const uint8_t *src8 = (const uint8_t *)src;
+        uint8_t *dst8 = (uint8_t *)dst;
+        for (size_t off = 0; off < total_bytes; off += chunk_bytes) {
+            size_t n = total_bytes - off;
+            if (n > chunk_bytes) n = chunk_bytes;
+            HIP_CHECK_I(hipMemcpy(dst8 + off, src8 + off, n, hipMemcpyHostToDevice));
+        }
+        return 0;
+    };
+
     // --- Upload global weights ---
 
     // Token embedding — keep on CPU to preserve VRAM for expert cache
@@ -3770,6 +3797,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
         // Output norm
         {
             size_t sz = hp->n_embd * sizeof(float);
+            fprintf(stderr, "GPU:   upload output_norm (%.2f KB)\n", (double)sz / 1024.0);
             HIP_CHECK_I(hipMalloc(&ctx->d_output_norm, sz));
             HIP_CHECK_I(hipMemcpy(ctx->d_output_norm, m->output_norm, sz, hipMemcpyHostToDevice));
             total_uploaded += sz;
@@ -3777,32 +3805,19 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 
         // LM head (output weight)
         {
-            // output shape: [n_embd, vocab_size] => vocab_size rows of n_embd
-            size_t row_blocks = hp->n_embd / QK_K;
             ctx->output_type = m->output_type;
-            if (m->output_type == GGML_TYPE_Q4_K) {
-                ctx->output_row_bytes = row_blocks * sizeof(block_q4_K);
-            } else if (m->output_type == GGML_TYPE_Q6_K) {
-                ctx->output_row_bytes = row_blocks * sizeof(block_q6_K);
-            } else {
-                ctx->output_row_bytes = hp->n_embd * sizeof(float);
-            }
-            size_t total_bytes = (size_t)hp->vocab_size * ctx->output_row_bytes;
+            ctx->output_row_bytes = m->output_size / hp->vocab_size;
+            size_t total_bytes = m->output_size;
+            fprintf(stderr, "GPU:   upload output_weight type=%d bytes=%.2f GB\n",
+                    m->output_type, (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
             HIP_CHECK_I(hipMalloc(&ctx->d_output, total_bytes));
-            HIP_CHECK_I(hipMemcpy(ctx->d_output, m->output, total_bytes, hipMemcpyHostToDevice));
+            if (upload_bytes(m->output, ctx->d_output, total_bytes) != 0) return -1;
             total_uploaded += total_bytes;
         }
     } else {
         // Store type info for pingpong section to use
         ctx->output_type = m->output_type;
-        size_t row_blocks = hp->n_embd / QK_K;
-        if (m->output_type == GGML_TYPE_Q4_K) {
-            ctx->output_row_bytes = row_blocks * sizeof(block_q4_K);
-        } else if (m->output_type == GGML_TYPE_Q6_K) {
-            ctx->output_row_bytes = row_blocks * sizeof(block_q6_K);
-        } else {
-            ctx->output_row_bytes = hp->n_embd * sizeof(float);
-        }
+        ctx->output_row_bytes = m->output_size / hp->vocab_size;
         ctx->d_output = nullptr;
         ctx->d_output_norm = nullptr;
     }
@@ -3834,7 +3849,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
         *d_type = type;
         *d_bytes = calc_weight_size(type, M, K);
         HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
-        HIP_CHECK_I(hipMemcpy(*d_dst, src, *d_bytes, hipMemcpyHostToDevice));
+        if (upload_bytes(src, *d_dst, *d_bytes) != 0) return -1;
         return 0;
     };
 
@@ -3842,7 +3857,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
     auto upload_f32 = [&](const float *src, float **d_dst, size_t n) -> int {
         size_t sz = n * sizeof(float);
         HIP_CHECK_I(hipMalloc(d_dst, sz));
-        HIP_CHECK_I(hipMemcpy(*d_dst, src, sz, hipMemcpyHostToDevice));
+        if (upload_bytes(src, *d_dst, sz) != 0) return -1;
         return 0;
     };
 
@@ -3858,14 +3873,14 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 
         // Common weights: attn_norm, ffn_norm, router
         HIP_CHECK_I(hipMalloc(&gl->d_attn_norm, norm_sz));
-        HIP_CHECK_I(hipMemcpy(gl->d_attn_norm, l->attn_norm, norm_sz, hipMemcpyHostToDevice));
+        if (upload_bytes(l->attn_norm, gl->d_attn_norm, norm_sz) != 0) return -1;
         HIP_CHECK_I(hipMalloc(&gl->d_ffn_norm, norm_sz));
-        HIP_CHECK_I(hipMemcpy(gl->d_ffn_norm, l->ffn_norm, norm_sz, hipMemcpyHostToDevice));
+        if (upload_bytes(l->ffn_norm, gl->d_ffn_norm, norm_sz) != 0) return -1;
         total_uploaded += 2 * norm_sz;
 
         size_t router_sz = (size_t)hp->n_experts * hp->n_embd * sizeof(float);
         HIP_CHECK_I(hipMalloc(&gl->d_router, router_sz));
-        HIP_CHECK_I(hipMemcpy(gl->d_router, l->router, router_sz, hipMemcpyHostToDevice));
+        if (upload_bytes(l->router, gl->d_router, router_sz) != 0) return -1;
         total_uploaded += router_sz;
 
         // Shared expert weights (all layers have these)
@@ -5225,18 +5240,20 @@ static bool consume_prefetch_nvme(gpu_ctx_t *ctx) {
         pf_vslots, pf_rslots, 32);
     uint64_t stride_pf = ctx->expert_stride;
     hipStream_t ts_pf = ctx->transfer_stream;
+    bool have_vram_cache = ctx->ecache.max_slots > 0 && ctx->ecache.d_buf != nullptr;
     for (int i = 0; i < n_nvme_h2d; i++) {
+        if (!have_vram_cache || pf_vslots[i] < 0 || pf_rslots[i] < 0) continue;
         (void)hipMemcpyAsync(
             (uint8_t *)ctx->ecache.d_buf + (size_t)pf_vslots[i] * stride_pf,
             (uint8_t *)ctx->rcache.buf + (size_t)pf_rslots[i] * stride_pf,
             stride_pf, hipMemcpyHostToDevice, ts_pf);
     }
-    if (n_nvme_h2d > 0) ctx->prof.spec_prefetched += n_nvme_h2d;
+    if (have_vram_cache && n_nvme_h2d > 0) ctx->prof.spec_prefetched += n_nvme_h2d;
     prefetch_mark_all_h2d_done(ctx->pf);
     prefetch_commit_ram_cache(ctx->pf, &ctx->rcache);
 
     int total_vpf = prefetch_vram_transfer_count(ctx->pf);
-    if (total_vpf > 0) {
+    if (have_vram_cache && total_vpf > 0) {
         (void)hipEventRecord(ctx->vram_prefetch_event, ctx->transfer_stream);
         ctx->vram_prefetch_active = true;
         ctx->prof.vram_prefetched += total_vpf;

@@ -424,10 +424,20 @@ int main(int argc, char **argv) {
             // User message
             tokens[n_prompt++] = im_start_id;
             {
-                char user_msg[4096];
-                snprintf(user_msg, sizeof(user_msg), "user\n%s", prompt);
+                size_t prompt_len = strlen(prompt);
+                size_t user_len = prompt_len + 6;
+                char *user_msg = malloc(user_len);
+                if (!user_msg) {
+                    fprintf(stderr, "Error: failed to allocate user prompt buffer\n");
+                    tokenizer_free(tok);
+                    model_free(model);
+                    return 1;
+                }
+                memcpy(user_msg, "user\n", 5);
+                memcpy(user_msg + 5, prompt, prompt_len + 1);
                 n_prompt += tokenizer_encode(tok, user_msg,
                                              tokens + n_prompt, max_tokens - n_prompt);
+                free(user_msg);
             }
             tokens[n_prompt++] = im_end_id;
             n_prompt += tokenizer_encode(tok, "\n",
