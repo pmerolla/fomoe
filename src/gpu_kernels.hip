@@ -24,6 +24,15 @@ enum ggml_dtype {
 
 float fp16_to_fp32(uint16_t h);
 
+static __device__ __forceinline__ float device_bf16_to_fp32(uint16_t b) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    v.u = (uint32_t)b << 16;
+    return v.f;
+}
+
 // From quant.h
 #define QK_K 256
 typedef struct {
@@ -2150,6 +2159,102 @@ __global__ void kernel_f32_matvec_coop(
 }
 
 // ============================================================
+// KERNEL 9c: F16 mat-vec (single matrix)
+// ============================================================
+
+__global__ void kernel_f16_matvec(
+    const __half *weight, const float *input, float *output,
+    int M, int K)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+
+    const __half *row_data = weight + (int64_t)row * K;
+    float sum = 0.0f;
+    for (int i = 0; i < K; i++)
+        sum += __half2float(row_data[i]) * input[i];
+    output[row] = sum;
+}
+
+// ============================================================
+// KERNEL 9d: F16 mat-vec cooperative (32 threads per row)
+// ============================================================
+
+__global__ void kernel_f16_matvec_coop(
+    const __half *weight, const float *input, float *output,
+    int M, int K)
+{
+    extern __shared__ float s_input[];
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    int tid = threadIdx.y * 32 + lane;
+    int block_threads = blockDim.y * 32;
+
+    for (int i = tid; i < K; i += block_threads)
+        s_input[i] = input[i];
+    __syncthreads();
+
+    if (row >= M) return;
+
+    const __half *row_data = weight + (int64_t)row * K;
+    float partial = 0.0f;
+    for (int i = lane; i < K; i += 32)
+        partial += __half2float(row_data[i]) * s_input[i];
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down(partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+// ============================================================
+// KERNEL 9e: BF16 mat-vec (single matrix)
+// ============================================================
+
+__global__ void kernel_bf16_matvec(
+    const uint16_t *weight, const float *input, float *output,
+    int M, int K)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+
+    const uint16_t *row_data = weight + (int64_t)row * K;
+    float sum = 0.0f;
+    for (int i = 0; i < K; i++)
+        sum += device_bf16_to_fp32(row_data[i]) * input[i];
+    output[row] = sum;
+}
+
+// ============================================================
+// KERNEL 9f: BF16 mat-vec cooperative (32 threads per row)
+// ============================================================
+
+__global__ void kernel_bf16_matvec_coop(
+    const uint16_t *weight, const float *input, float *output,
+    int M, int K)
+{
+    extern __shared__ float s_input[];
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    int tid = threadIdx.y * 32 + lane;
+    int block_threads = blockDim.y * 32;
+
+    for (int i = tid; i < K; i += block_threads)
+        s_input[i] = input[i];
+    __syncthreads();
+
+    if (row >= M) return;
+
+    const uint16_t *row_data = weight + (int64_t)row * K;
+    float partial = 0.0f;
+    for (int i = lane; i < K; i += 32)
+        partial += device_bf16_to_fp32(row_data[i]) * s_input[i];
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down(partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+// ============================================================
 // KERNEL 10: RMS Norm
 // Block: (256), Grid: (1)
 // Two-pass: sum of squares -> normalize * weight
@@ -2686,6 +2791,14 @@ static void dispatch_matvec(hipStream_t s, const void *weight, int type,
         } else if (type == GGML_TYPE_Q8_0_ID) {
             kernel_q8_0_matvec_coop<<<cgrid, cblock, 0, s>>>(weight, input, output, M, K);
             return;
+        } else if (type == GGML_TYPE_F16_ID) {
+            kernel_f16_matvec_coop<<<cgrid, cblock, K * sizeof(float), s>>>(
+                (const __half *)weight, input, output, M, K);
+            return;
+        } else if (type == GGML_TYPE_BF16) {
+            kernel_bf16_matvec_coop<<<cgrid, cblock, K * sizeof(float), s>>>(
+                (const uint16_t *)weight, input, output, M, K);
+            return;
         } else if (type == GGML_TYPE_F32_ID) {
             kernel_f32_matvec_coop<<<cgrid, cblock, K * sizeof(float), s>>>(
                 (const float *)weight, input, output, M, K);
@@ -2704,6 +2817,12 @@ static void dispatch_matvec(hipStream_t s, const void *weight, int type,
         kernel_q8_0_matvec_coop<<<(M + 7) / 8, dim3(32, 8), 0, s>>>(weight, input, output, M, K);
     } else if (type == GGML_TYPE_MXFP4_ID) {
         kernel_mxfp4_matvec_single<<<grid, block, 0, s>>>(weight, input, output, M, K);
+    } else if (type == GGML_TYPE_F16_ID) {
+        kernel_f16_matvec<<<grid, block, 0, s>>>(
+            (const __half *)weight, input, output, M, K);
+    } else if (type == GGML_TYPE_BF16) {
+        kernel_bf16_matvec<<<grid, block, 0, s>>>(
+            (const uint16_t *)weight, input, output, M, K);
     } else if (type == GGML_TYPE_F32_ID) {
         kernel_f32_matvec<<<grid, block, 0, s>>>(
             (const float *)weight, input, output, M, K);
@@ -3795,11 +3914,16 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 
     auto upload_matrix = [&](const void *src, int type, int M, int K,
                              void **d_dst, int *d_type, size_t *d_bytes) -> int {
-        if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+        if (type == GGML_TYPE_BF16) {
+#ifdef QMOE_CUDA
+            *d_type = type;
+            *d_bytes = (size_t)M * (size_t)K * sizeof(uint16_t);
+            HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
+            return upload_bytes(src, *d_dst, *d_bytes);
+#else
             if (!allow_fp_upcast) {
                 fprintf(stderr,
-                        "GPU: unsupported matrix type %d for CUDA upload; rerun with QMOE_UPCAST_FP16=1 to upcast F16/BF16 matrices on upload\n",
-                        type);
+                        "GPU: unsupported BF16 matrix for CUDA upload; rerun with QMOE_UPCAST_FP16=1 to upcast BF16 matrices on upload\n");
                 return -1;
             }
             size_t n = (size_t)M * (size_t)K;
@@ -3809,13 +3933,9 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
                 return -1;
             }
             const uint16_t *src16 = (const uint16_t *)src;
-            if (type == GGML_TYPE_F16) {
-                for (size_t i = 0; i < n; i++) tmp[i] = fp16_to_fp32(src16[i]);
-            } else {
-                for (size_t i = 0; i < n; i++) {
-                    uint32_t bits = (uint32_t)src16[i] << 16;
-                    memcpy(&tmp[i], &bits, sizeof(float));
-                }
+            for (size_t i = 0; i < n; i++) {
+                uint32_t bits = (uint32_t)src16[i] << 16;
+                memcpy(&tmp[i], &bits, sizeof(float));
             }
             *d_type = GGML_TYPE_F32;
             *d_bytes = n * sizeof(float);
@@ -3823,10 +3943,13 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
             int rc = upload_bytes(tmp, *d_dst, *d_bytes);
             free(tmp);
             return rc;
+#endif
         }
 
         *d_type = type;
-        if (type == GGML_TYPE_MXFP4_ID) {
+        if (type == GGML_TYPE_F16) {
+            *d_bytes = (size_t)M * (size_t)K * sizeof(uint16_t);
+        } else if (type == GGML_TYPE_MXFP4_ID) {
             *d_bytes = (size_t)M * ((size_t)K / QK_MXFP4) * sizeof(block_mxfp4);
         } else if (type == GGML_TYPE_Q8_0) {
             *d_bytes = (size_t)M * ((size_t)K / QK8_0) * sizeof(block_q8_0);
@@ -3866,10 +3989,12 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
         {
             size_t total_bytes = m->output_size;
             ctx->output_type = m->output_type;
-            if (allow_fp_upcast && (m->output_type == GGML_TYPE_F16 || m->output_type == GGML_TYPE_BF16)) {
+#ifndef QMOE_CUDA
+            if (allow_fp_upcast && m->output_type == GGML_TYPE_BF16) {
                 ctx->output_type = GGML_TYPE_F32;
                 total_bytes = (size_t)hp->vocab_size * (size_t)hp->n_embd * sizeof(float);
             }
+#endif
             ctx->output_row_bytes = total_bytes / hp->vocab_size;
             fprintf(stderr, "GPU:   upload output_weight type=%d bytes=%.2f GB\n",
                     ctx->output_type, (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
@@ -3880,8 +4005,12 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
         }
     } else {
         // Store type info for pingpong section to use
-        ctx->output_type = (allow_fp_upcast && (m->output_type == GGML_TYPE_F16 || m->output_type == GGML_TYPE_BF16))
+#ifndef QMOE_CUDA
+        ctx->output_type = (allow_fp_upcast && m->output_type == GGML_TYPE_BF16)
                          ? GGML_TYPE_F32 : m->output_type;
+#else
+        ctx->output_type = m->output_type;
+#endif
         ctx->output_row_bytes = (ctx->output_type != m->output_type)
                               ? (size_t)hp->n_embd * sizeof(float)
                               : m->output_size / hp->vocab_size;
@@ -4375,9 +4504,11 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
                 last_dc->output_row_bytes = row_blocks * sizeof(block_q4_K);
             } else if (m_pp->output_type == GGML_TYPE_Q6_K) {
                 last_dc->output_row_bytes = row_blocks * sizeof(block_q6_K);
-            } else if (allow_fp_upcast && (m_pp->output_type == GGML_TYPE_F16 || m_pp->output_type == GGML_TYPE_BF16)) {
+#ifndef QMOE_CUDA
+            } else if (allow_fp_upcast && m_pp->output_type == GGML_TYPE_BF16) {
                 last_dc->output_type = GGML_TYPE_F32;
                 last_dc->output_row_bytes = hp->n_embd * sizeof(float);
+#endif
             } else {
                 last_dc->output_row_bytes = hp->n_embd * sizeof(float);
             }
