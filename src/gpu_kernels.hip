@@ -6133,10 +6133,20 @@ static float *gpu_forward_pingpong(gpu_ctx_t *ctx, void *model_ptr, int token_id
         }
         // Execute deferred spec prefetch: worker saved RAM-hit expert list,
         // main thread does VRAM alloc + DMA (thread-safe, single-threaded).
-        // Non-blocking: only if worker already finished, skip otherwise.
+        // Default: non-blocking (skip if worker not done yet).
+        // Deterministic mode (QMOE_BACKFILL_SYNC): wait for worker to ensure
+        // identical cache evolution regardless of compute speed.
         if (ctx->spec_worker.active && il > 0) {
             auto *w = &ctx->spec_worker;
-            if (w->work_done) {
+            bool ready = w->work_done;
+            if (!ready && ctx->backfill.sync_mode) {
+                // Deterministic: spin-wait for spec worker to finish,
+                // ensuring identical prefetch behavior across machines.
+                while (!w->work_done) {}
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                ready = true;
+            }
+            if (ready) {
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);
                 if (w->n_pf > 0) {
                     int pf_cache_il = (il) / 2;
