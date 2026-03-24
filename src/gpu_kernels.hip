@@ -18,8 +18,11 @@ enum ggml_dtype {
     GGML_TYPE_Q4_K = 12,
     GGML_TYPE_Q5_K = 13,
     GGML_TYPE_Q6_K = 14,
+    GGML_TYPE_BF16 = 30,
     GGML_TYPE_MXFP4 = 39,
 };
+
+float fp16_to_fp32(uint16_t h);
 
 // From quant.h
 #define QK_K 256
@@ -3531,8 +3534,13 @@ extern "C" gpu_ctx_t *gpu_init(void) {
     ctx->ram_cache_mb = -1;  // auto by default
     ctx->vram_cache_mb = -1; // auto by default
     ctx->n_devices = 1;
+    ctx->pingpong = false;
 
     fprintf(stderr, "GPU: expert FFN buffers allocated (GPU 0)\n");
+
+    if (getenv("QMOE_PINGPONG") != NULL && device_count < 2) {
+        fprintf(stderr, "GPU: QMOE_PINGPONG requested but only one GPU is available; ping-pong disabled\n");
+    }
 
     // ---- GPU1 init (expert engine) ----
     if (device_count >= 2) {
@@ -3767,6 +3775,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
             hp->n_layers, hp->n_embd, hp->n_heads, hp->n_kv_heads, hp->vocab_size);
 
     size_t total_uploaded = 0;
+    bool allow_fp_upcast = (getenv("QMOE_UPCAST_FP16") != NULL);
 
     auto upload_bytes = [&](const void *src, void *dst, size_t total_bytes) -> int {
         if (!src || !dst) {
@@ -3782,6 +3791,56 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
             HIP_CHECK_I(hipMemcpy(dst8 + off, src8 + off, n, hipMemcpyHostToDevice));
         }
         return 0;
+    };
+
+    auto upload_matrix = [&](const void *src, int type, int M, int K,
+                             void **d_dst, int *d_type, size_t *d_bytes) -> int {
+        if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+            if (!allow_fp_upcast) {
+                fprintf(stderr,
+                        "GPU: unsupported matrix type %d for CUDA upload; rerun with QMOE_UPCAST_FP16=1 to upcast F16/BF16 matrices on upload\n",
+                        type);
+                return -1;
+            }
+            size_t n = (size_t)M * (size_t)K;
+            float *tmp = (float *)malloc(n * sizeof(float));
+            if (!tmp) {
+                fprintf(stderr, "GPU: OOM converting %d x %d matrix type=%d to F32\n", M, K, type);
+                return -1;
+            }
+            const uint16_t *src16 = (const uint16_t *)src;
+            if (type == GGML_TYPE_F16) {
+                for (size_t i = 0; i < n; i++) tmp[i] = fp16_to_fp32(src16[i]);
+            } else {
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t bits = (uint32_t)src16[i] << 16;
+                    memcpy(&tmp[i], &bits, sizeof(float));
+                }
+            }
+            *d_type = GGML_TYPE_F32;
+            *d_bytes = n * sizeof(float);
+            HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
+            int rc = upload_bytes(tmp, *d_dst, *d_bytes);
+            free(tmp);
+            return rc;
+        }
+
+        *d_type = type;
+        if (type == GGML_TYPE_MXFP4_ID) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_MXFP4) * sizeof(block_mxfp4);
+        } else if (type == GGML_TYPE_Q8_0) {
+            *d_bytes = (size_t)M * ((size_t)K / QK8_0) * sizeof(block_q8_0);
+        } else if (type == GGML_TYPE_Q4_K) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_K) * sizeof(block_q4_K);
+        } else if (type == GGML_TYPE_Q5_K) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_K) * sizeof(block_q5_K);
+        } else if (type == GGML_TYPE_Q6_K) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_K) * sizeof(block_q6_K);
+        } else {
+            *d_bytes = (size_t)M * (size_t)K * sizeof(float);
+        }
+        HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
+        return upload_bytes(src, *d_dst, *d_bytes);
     };
 
     // --- Upload global weights ---
@@ -3805,19 +3864,27 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 
         // LM head (output weight)
         {
-            ctx->output_type = m->output_type;
-            ctx->output_row_bytes = m->output_size / hp->vocab_size;
             size_t total_bytes = m->output_size;
+            ctx->output_type = m->output_type;
+            if (allow_fp_upcast && (m->output_type == GGML_TYPE_F16 || m->output_type == GGML_TYPE_BF16)) {
+                ctx->output_type = GGML_TYPE_F32;
+                total_bytes = (size_t)hp->vocab_size * (size_t)hp->n_embd * sizeof(float);
+            }
+            ctx->output_row_bytes = total_bytes / hp->vocab_size;
             fprintf(stderr, "GPU:   upload output_weight type=%d bytes=%.2f GB\n",
-                    m->output_type, (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
-            HIP_CHECK_I(hipMalloc(&ctx->d_output, total_bytes));
-            if (upload_bytes(m->output, ctx->d_output, total_bytes) != 0) return -1;
+                    ctx->output_type, (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+            size_t ignored = 0;
+            if (upload_matrix(m->output, m->output_type, hp->vocab_size, hp->n_embd,
+                              &ctx->d_output, &ctx->output_type, &ignored) != 0) return -1;
             total_uploaded += total_bytes;
         }
     } else {
         // Store type info for pingpong section to use
-        ctx->output_type = m->output_type;
-        ctx->output_row_bytes = m->output_size / hp->vocab_size;
+        ctx->output_type = (allow_fp_upcast && (m->output_type == GGML_TYPE_F16 || m->output_type == GGML_TYPE_BF16))
+                         ? GGML_TYPE_F32 : m->output_type;
+        ctx->output_row_bytes = (ctx->output_type != m->output_type)
+                              ? (size_t)hp->n_embd * sizeof(float)
+                              : m->output_size / hp->vocab_size;
         ctx->d_output = nullptr;
         ctx->d_output_norm = nullptr;
     }
@@ -3826,31 +3893,10 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
     ctx->layers = (struct gpu_layer *)calloc(hp->n_layers, sizeof(struct gpu_layer));
     if (!ctx->layers) return -1;
 
-    // Helper: compute quantized weight size for M rows of K columns
-    auto calc_weight_size = [](int type, int M, int K) -> size_t {
-        if (type == GGML_TYPE_MXFP4_ID) {
-            int nb = K / QK_MXFP4;
-            return (size_t)M * nb * sizeof(block_mxfp4);
-        }
-        if (type == GGML_TYPE_Q8_0) {
-            int nb = K / QK8_0;
-            return (size_t)M * nb * sizeof(block_q8_0);
-        }
-        int nb = K / QK_K;
-        if (type == GGML_TYPE_Q4_K) return (size_t)M * nb * sizeof(block_q4_K);
-        if (type == GGML_TYPE_Q5_K) return (size_t)M * nb * sizeof(block_q5_K);
-        if (type == GGML_TYPE_Q6_K) return (size_t)M * nb * sizeof(block_q6_K);
-        return (size_t)M * K * sizeof(float);
-    };
-
     // Helper: upload a quantized weight matrix to GPU
     auto upload_weight = [&](void *src, int type, int M, int K,
                               void **d_dst, int *d_type, size_t *d_bytes) -> int {
-        *d_type = type;
-        *d_bytes = calc_weight_size(type, M, K);
-        HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
-        if (upload_bytes(src, *d_dst, *d_bytes) != 0) return -1;
-        return 0;
+        return upload_matrix(src, type, M, K, d_dst, d_type, d_bytes);
     };
 
     // Helper: upload f32 buffer
@@ -4329,12 +4375,16 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
                 last_dc->output_row_bytes = row_blocks * sizeof(block_q4_K);
             } else if (m_pp->output_type == GGML_TYPE_Q6_K) {
                 last_dc->output_row_bytes = row_blocks * sizeof(block_q6_K);
+            } else if (allow_fp_upcast && (m_pp->output_type == GGML_TYPE_F16 || m_pp->output_type == GGML_TYPE_BF16)) {
+                last_dc->output_type = GGML_TYPE_F32;
+                last_dc->output_row_bytes = hp->n_embd * sizeof(float);
             } else {
                 last_dc->output_row_bytes = hp->n_embd * sizeof(float);
             }
             size_t output_total = (size_t)hp->vocab_size * last_dc->output_row_bytes;
-            HIP_CHECK_I(hipMalloc(&last_dc->d_output, output_total));
-            HIP_CHECK_I(hipMemcpy(last_dc->d_output, m_pp->output, output_total, hipMemcpyHostToDevice));
+            size_t ignored = 0;
+            if (upload_matrix(m_pp->output, m_pp->output_type, hp->vocab_size, hp->n_embd,
+                              &last_dc->d_output, &last_dc->output_type, &ignored) != 0) return -1;
 
             // Logits buffer + pinned host
             HIP_CHECK_I(hipMalloc(&last_dc->d_logits, hp->vocab_size * sizeof(float)));

@@ -25,33 +25,6 @@ static void *read_tensor_data(gguf_ctx_t *ctx, const char *name, size_t *out_siz
     }
     if (gguf_read_tensor(ctx, tid, data, ti->size) == 0) { free(data); return NULL; }
 
-    if (ti->type == GGML_TYPE_F16 || ti->type == GGML_TYPE_BF16) {
-        int64_t nelements = 1;
-        for (uint32_t d = 0; d < ti->n_dims; d++) nelements *= ti->dims[d];
-
-        float *f32 = malloc((size_t)nelements * sizeof(float));
-        if (!f32) {
-            free(data);
-            fprintf(stderr, "model: OOM converting tensor %s to F32\n", name);
-            return NULL;
-        }
-
-        const uint16_t *src = (const uint16_t *)data;
-        if (ti->type == GGML_TYPE_F16) {
-            for (int64_t i = 0; i < nelements; i++) f32[i] = fp16_to_fp32(src[i]);
-        } else {
-            for (int64_t i = 0; i < nelements; i++) {
-                uint32_t bits = (uint32_t)src[i] << 16;
-                memcpy(&f32[i], &bits, sizeof(float));
-            }
-        }
-
-        free(data);
-        if (out_size) *out_size = (size_t)nelements * sizeof(float);
-        if (out_type) *out_type = GGML_TYPE_F32;
-        return f32;
-    }
-
     if (out_size) *out_size = ti->size;
     if (out_type) *out_type = ti->type;
     return data;
