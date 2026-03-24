@@ -5551,13 +5551,17 @@ static void *pp_spec_worker_fn(void *arg) {
         int n_to_pf = 0;
         // Device-local layer index for VRAM cache (cache uses n_layers=30)
         int next_cache_il = w->next_il / 2;
+        bool have_next_vram_cache = w->next_ec && w->next_ec->max_slots > 0 && w->next_ec->map;
 
         // Reset spec NVMe request list
         ctx->spec_nvme_n[w->next_il] = 0;
 
         for (int k = 0; k < w->n_pred; k++) {
             int eid = w->pred_ids[k];
-            int slot = w->next_ec->map[next_cache_il * w->next_ec->n_experts + eid];
+            int slot = -1;
+            if (have_next_vram_cache) {
+                slot = w->next_ec->map[next_cache_il * w->next_ec->n_experts + eid];
+            }
             if (slot >= 0) {
                 vram_cache_touch(w->next_ec, slot);
                 continue;
@@ -7184,7 +7188,9 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
             int pfa_vslots[32], pfa_rslots[32];
             int n_ram_h2d = prefetch_get_ram_transfers(ctx->pf,
                 pfa_vslots, pfa_rslots, 32);
+            bool have_vram_cache = ctx->ecache.max_slots > 0 && ctx->ecache.d_buf != nullptr;
             for (int i = 0; i < n_ram_h2d; i++) {
+                if (!have_vram_cache || pfa_vslots[i] < 0 || pfa_rslots[i] < 0) continue;
                 (void)hipMemcpyAsync(
                     (uint8_t *)ctx->ecache.d_buf + (size_t)pfa_vslots[i] * stride,
                     (uint8_t *)ctx->rcache.buf + (size_t)pfa_rslots[i] * stride,
@@ -7195,7 +7201,7 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
                 ctx->pf_pending = true;
             } else {
                 int total_vpf = prefetch_vram_transfer_count(ctx->pf);
-                if (total_vpf > 0) {
+                if (have_vram_cache && total_vpf > 0) {
                     prefetch_mark_all_h2d_done(ctx->pf);
                     (void)hipEventRecord(ctx->vram_prefetch_event, ts);
                     ctx->vram_prefetch_active = true;
