@@ -24,7 +24,7 @@ enum ggml_dtype {
 
 float fp16_to_fp32(uint16_t h);
 
-static __device__ __forceinline__ float device_bf16_to_fp32(uint16_t b) {
+static __device__ inline float device_bf16_to_fp32(uint16_t b) {
     union {
         uint32_t u;
         float f;
@@ -4087,7 +4087,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 #else
             if (!allow_fp_upcast) {
                 fprintf(stderr,
-                        "GPU: unsupported BF16 matrix for CUDA upload; rerun with QMOE_UPCAST_FP16=1 to upcast BF16 matrices on upload\n");
+                        "GPU: unsupported BF16 matrix for ROCm upload; rerun with QMOE_UPCAST_FP16=1 to upcast BF16 matrices on upload\n");
                 return -1;
             }
             size_t n = (size_t)M * (size_t)K;
