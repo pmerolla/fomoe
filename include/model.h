@@ -135,9 +135,11 @@ typedef struct {
     // Global weights
     void           *token_embd;
     enum ggml_dtype  token_embd_type;
+    size_t           token_embd_size;
     float           *output_norm;
     void            *output;
     enum ggml_dtype  output_type;
+    size_t           output_size;
 
     // Per-layer weights
     layer_weights_t *layers;

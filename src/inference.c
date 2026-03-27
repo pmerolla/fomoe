@@ -427,6 +427,8 @@ float *forward(model_t *model, int token_id, int pos) {
         float *logits = gpu_forward(model->gpu_ctx, model, token_id, pos);
         if (logits) return logits;
         fprintf(stderr, "forward: GPU failed, CPU fallback\n");
+        gpu_free(model->gpu_ctx);
+        model->gpu_ctx = NULL;
     }
 #endif
 

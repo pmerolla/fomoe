@@ -18,8 +18,20 @@ enum ggml_dtype {
     GGML_TYPE_Q4_K = 12,
     GGML_TYPE_Q5_K = 13,
     GGML_TYPE_Q6_K = 14,
+    GGML_TYPE_BF16 = 30,
     GGML_TYPE_MXFP4 = 39,
 };
+
+float fp16_to_fp32(uint16_t h);
+
+static __device__ __forceinline__ float device_bf16_to_fp32(uint16_t b) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    v.u = (uint32_t)b << 16;
+    return v.f;
+}
 
 // From quant.h
 #define QK_K 256
@@ -201,9 +213,11 @@ typedef struct {
     // Global weights
     void            *token_embd;
     enum ggml_dtype  token_embd_type;
+    size_t           token_embd_size;
     float           *output_norm;
     void            *output;
     enum ggml_dtype  output_type;
+    size_t           output_size;
 
     // Per-layer weights
     layer_weights_t *layers;
@@ -2145,6 +2159,266 @@ __global__ void kernel_f32_matvec_coop(
 }
 
 // ============================================================
+// KERNEL 9c: F16 mat-vec (single matrix)
+// ============================================================
+
+__global__ void kernel_f16_matvec(
+    const __half *weight, const float *input, float *output,
+    int M, int K)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+
+    const __half *row_data = weight + (int64_t)row * K;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    int K4 = K >> 2;
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)input;
+    int i = 0;
+    for (; i + 3 < K4; i += 4) {
+        uint2 packed0 = row4[i + 0];
+        uint2 packed1 = row4[i + 1];
+        uint2 packed2 = row4[i + 2];
+        uint2 packed3 = row4[i + 3];
+        __half2 h01 = *(const __half2 *)&packed0.x;
+        __half2 h23 = *(const __half2 *)&packed0.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v0 = inp4[i + 0];
+        sum0 += w01.x * v0.x + w01.y * v0.y + w23.x * v0.z + w23.y * v0.w;
+
+        h01 = *(const __half2 *)&packed1.x;
+        h23 = *(const __half2 *)&packed1.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        float4 v1 = inp4[i + 1];
+        sum1 += w01.x * v1.x + w01.y * v1.y + w23.x * v1.z + w23.y * v1.w;
+
+        h01 = *(const __half2 *)&packed2.x;
+        h23 = *(const __half2 *)&packed2.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        float4 v2 = inp4[i + 2];
+        sum2 += w01.x * v2.x + w01.y * v2.y + w23.x * v2.z + w23.y * v2.w;
+
+        h01 = *(const __half2 *)&packed3.x;
+        h23 = *(const __half2 *)&packed3.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        float4 v3 = inp4[i + 3];
+        sum3 += w01.x * v3.x + w01.y * v3.y + w23.x * v3.z + w23.y * v3.w;
+    }
+    for (; i < K4; i++) {
+        uint2 packed = row4[i];
+        __half2 h01 = *(const __half2 *)&packed.x;
+        __half2 h23 = *(const __half2 *)&packed.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v = inp4[i];
+        sum0 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+    }
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int i = K4 << 2; i < K; i++)
+        sum += __half2float(row_data[i]) * input[i];
+    output[row] = sum;
+}
+
+// ============================================================
+// KERNEL 9d: F16 mat-vec cooperative (32 threads per row)
+// ============================================================
+
+__global__ void kernel_f16_matvec_coop(
+    const __half *weight, const float *input, float *output,
+    int M, int K)
+{
+    extern __shared__ float s_input[];
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    int tid = threadIdx.y * 32 + lane;
+    int block_threads = blockDim.y * 32;
+
+    for (int i = tid; i < K; i += block_threads)
+        s_input[i] = input[i];
+    __syncthreads();
+
+    if (row >= M) return;
+
+    const __half *row_data = weight + (int64_t)row * K;
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)s_input;
+    int K4 = K >> 2;
+    float partial0 = 0.0f, partial1 = 0.0f;
+    int i = lane;
+    for (; i + 32 < K4; i += 64) {
+        uint2 packed = row4[i];
+        __half2 h01 = *(const __half2 *)&packed.x;
+        __half2 h23 = *(const __half2 *)&packed.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v = inp4[i];
+        partial0 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+
+        packed = row4[i + 32];
+        h01 = *(const __half2 *)&packed.x;
+        h23 = *(const __half2 *)&packed.y;
+        w01 = __half22float2(h01);
+        w23 = __half22float2(h23);
+        v = inp4[i + 32];
+        partial1 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+    }
+    for (; i < K4; i += 32) {
+        uint2 packed = row4[i];
+        __half2 h01 = *(const __half2 *)&packed.x;
+        __half2 h23 = *(const __half2 *)&packed.y;
+        float2 w01 = __half22float2(h01);
+        float2 w23 = __half22float2(h23);
+        float4 v = inp4[i];
+        partial0 += w01.x * v.x + w01.y * v.y + w23.x * v.z + w23.y * v.w;
+    }
+    float partial = partial0 + partial1;
+    for (int i = (K4 << 2) + lane; i < K; i += 32)
+        partial += __half2float(row_data[i]) * s_input[i];
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down(partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+// ============================================================
+// KERNEL 9e: BF16 mat-vec (single matrix)
+// ============================================================
+
+__global__ void kernel_bf16_matvec(
+    const uint16_t *weight, const float *input, float *output,
+    int M, int K)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= M) return;
+
+    const uint16_t *row_data = weight + (int64_t)row * K;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    int K4 = K >> 2;
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)input;
+    int i = 0;
+    for (; i + 3 < K4; i += 4) {
+        uint2 packed = row4[i + 0];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v0 = inp4[i + 0];
+        sum0 += device_bf16_to_fp32(b0) * v0.x + device_bf16_to_fp32(b1) * v0.y
+             +  device_bf16_to_fp32(b2) * v0.z + device_bf16_to_fp32(b3) * v0.w;
+
+        packed = row4[i + 1];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        float4 v1 = inp4[i + 1];
+        sum1 += device_bf16_to_fp32(b0) * v1.x + device_bf16_to_fp32(b1) * v1.y
+             +  device_bf16_to_fp32(b2) * v1.z + device_bf16_to_fp32(b3) * v1.w;
+
+        packed = row4[i + 2];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        float4 v2 = inp4[i + 2];
+        sum2 += device_bf16_to_fp32(b0) * v2.x + device_bf16_to_fp32(b1) * v2.y
+             +  device_bf16_to_fp32(b2) * v2.z + device_bf16_to_fp32(b3) * v2.w;
+
+        packed = row4[i + 3];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        float4 v3 = inp4[i + 3];
+        sum3 += device_bf16_to_fp32(b0) * v3.x + device_bf16_to_fp32(b1) * v3.y
+             +  device_bf16_to_fp32(b2) * v3.z + device_bf16_to_fp32(b3) * v3.w;
+    }
+    for (; i < K4; i++) {
+        uint2 packed = row4[i];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v = inp4[i];
+        sum0 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+             +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+    }
+    float sum = sum0 + sum1 + sum2 + sum3;
+    for (int i = K4 << 2; i < K; i++)
+        sum += device_bf16_to_fp32(row_data[i]) * input[i];
+    output[row] = sum;
+}
+
+// ============================================================
+// KERNEL 9f: BF16 mat-vec cooperative (32 threads per row)
+// ============================================================
+
+__global__ void kernel_bf16_matvec_coop(
+    const uint16_t *weight, const float *input, float *output,
+    int M, int K)
+{
+    extern __shared__ float s_input[];
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    int tid = threadIdx.y * 32 + lane;
+    int block_threads = blockDim.y * 32;
+
+    for (int i = tid; i < K; i += block_threads)
+        s_input[i] = input[i];
+    __syncthreads();
+
+    if (row >= M) return;
+
+    const uint16_t *row_data = weight + (int64_t)row * K;
+    const uint2 *row4 = (const uint2 *)row_data;
+    const float4 *inp4 = (const float4 *)s_input;
+    int K4 = K >> 2;
+    float partial0 = 0.0f, partial1 = 0.0f;
+    int i = lane;
+    for (; i + 32 < K4; i += 64) {
+        uint2 packed = row4[i];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v = inp4[i];
+        partial0 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+                 +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+
+        packed = row4[i + 32];
+        b0 = (uint16_t)(packed.x & 0xffffu);
+        b1 = (uint16_t)(packed.x >> 16);
+        b2 = (uint16_t)(packed.y & 0xffffu);
+        b3 = (uint16_t)(packed.y >> 16);
+        v = inp4[i + 32];
+        partial1 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+                 +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+    }
+    for (; i < K4; i += 32) {
+        uint2 packed = row4[i];
+        uint16_t b0 = (uint16_t)(packed.x & 0xffffu);
+        uint16_t b1 = (uint16_t)(packed.x >> 16);
+        uint16_t b2 = (uint16_t)(packed.y & 0xffffu);
+        uint16_t b3 = (uint16_t)(packed.y >> 16);
+        float4 v = inp4[i];
+        partial0 += device_bf16_to_fp32(b0) * v.x + device_bf16_to_fp32(b1) * v.y
+                 +  device_bf16_to_fp32(b2) * v.z + device_bf16_to_fp32(b3) * v.w;
+    }
+    float partial = partial0 + partial1;
+    for (int i = (K4 << 2) + lane; i < K; i += 32)
+        partial += device_bf16_to_fp32(row_data[i]) * s_input[i];
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down(partial, offset);
+    if (lane == 0) output[row] = partial;
+}
+
+// ============================================================
 // KERNEL 10: RMS Norm
 // Block: (256), Grid: (1)
 // Two-pass: sum of squares -> normalize * weight
@@ -2681,6 +2955,14 @@ static void dispatch_matvec(hipStream_t s, const void *weight, int type,
         } else if (type == GGML_TYPE_Q8_0_ID) {
             kernel_q8_0_matvec_coop<<<cgrid, cblock, 0, s>>>(weight, input, output, M, K);
             return;
+        } else if (type == GGML_TYPE_F16_ID) {
+            kernel_f16_matvec_coop<<<cgrid, cblock, K * sizeof(float), s>>>(
+                (const __half *)weight, input, output, M, K);
+            return;
+        } else if (type == GGML_TYPE_BF16) {
+            kernel_bf16_matvec_coop<<<cgrid, cblock, K * sizeof(float), s>>>(
+                (const uint16_t *)weight, input, output, M, K);
+            return;
         } else if (type == GGML_TYPE_F32_ID) {
             kernel_f32_matvec_coop<<<cgrid, cblock, K * sizeof(float), s>>>(
                 (const float *)weight, input, output, M, K);
@@ -2699,6 +2981,12 @@ static void dispatch_matvec(hipStream_t s, const void *weight, int type,
         kernel_q8_0_matvec_coop<<<(M + 7) / 8, dim3(32, 8), 0, s>>>(weight, input, output, M, K);
     } else if (type == GGML_TYPE_MXFP4_ID) {
         kernel_mxfp4_matvec_single<<<grid, block, 0, s>>>(weight, input, output, M, K);
+    } else if (type == GGML_TYPE_F16_ID) {
+        kernel_f16_matvec<<<grid, block, 0, s>>>(
+            (const __half *)weight, input, output, M, K);
+    } else if (type == GGML_TYPE_BF16) {
+        kernel_bf16_matvec<<<grid, block, 0, s>>>(
+            (const uint16_t *)weight, input, output, M, K);
     } else if (type == GGML_TYPE_F32_ID) {
         kernel_f32_matvec<<<grid, block, 0, s>>>(
             (const float *)weight, input, output, M, K);
@@ -3499,8 +3787,8 @@ extern "C" gpu_ctx_t *gpu_init(void) {
     fprintf(stderr, "GPU: %s (%zu MB VRAM)\n",
             props.name, props.totalGlobalMem / (1024 * 1024));
 #ifdef QMOE_CUDA
-    fprintf(stderr, "GPU: sm_%d%d, SMs=%d, clock=%d MHz\n",
-            props.major, props.minor, props.multiProcessorCount, props.clockRate / 1000);
+    fprintf(stderr, "GPU: sm_%d%d, SMs=%d\n",
+            props.major, props.minor, props.multiProcessorCount);
 #else
     fprintf(stderr, "GPU: arch=%s, CUs=%d, clock=%d MHz\n",
             props.gcnArchName, props.multiProcessorCount, props.clockRate / 1000);
@@ -3529,8 +3817,13 @@ extern "C" gpu_ctx_t *gpu_init(void) {
     ctx->ram_cache_mb = -1;  // auto by default
     ctx->vram_cache_mb = -1; // auto by default
     ctx->n_devices = 1;
+    ctx->pingpong = false;
 
     fprintf(stderr, "GPU: expert FFN buffers allocated (GPU 0)\n");
+
+    if (getenv("QMOE_PINGPONG") != NULL && device_count < 2) {
+        fprintf(stderr, "GPU: QMOE_PINGPONG requested but only one GPU is available; ping-pong disabled\n");
+    }
 
     // ---- GPU1 init (expert engine) ----
     if (device_count >= 2) {
@@ -3654,7 +3947,16 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
     ctx->expert_intermediate = hp->expert_intermediate;
     ctx->shared_expert_intermediate = hp->shared_expert_intermediate;
     ctx->vocab_size = hp->vocab_size;
-    ctx->ctx_len = (hp->ctx_len > 4096) ? 4096 : hp->ctx_len;
+    ctx->ctx_len = hp->ctx_len;
+    {
+        const char *gpu_ctx_limit = getenv("QMOE_GPU_CTX_LIMIT");
+        if (gpu_ctx_limit && *gpu_ctx_limit) {
+            uint32_t limit = (uint32_t)atoi(gpu_ctx_limit);
+            if (limit > 0 && limit < ctx->ctx_len) ctx->ctx_len = limit;
+        } else if (ctx->ctx_len > 4096) {
+            ctx->ctx_len = 4096;
+        }
+    }
     ctx->rope_dim = hp->rope_dim;
     ctx->rope_freq_base = hp->rope_freq_base;
     ctx->rms_norm_eps = hp->rms_norm_eps;
@@ -3756,6 +4058,77 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
             hp->n_layers, hp->n_embd, hp->n_heads, hp->n_kv_heads, hp->vocab_size);
 
     size_t total_uploaded = 0;
+    bool allow_fp_upcast = (getenv("QMOE_UPCAST_FP16") != NULL);
+
+    auto upload_bytes = [&](const void *src, void *dst, size_t total_bytes) -> int {
+        if (!src || !dst) {
+            fprintf(stderr, "GPU: upload_bytes null ptr src=%p dst=%p bytes=%zu\n", src, dst, total_bytes);
+            return -1;
+        }
+        const size_t chunk_bytes = 64ull * 1024ull * 1024ull;
+        const uint8_t *src8 = (const uint8_t *)src;
+        uint8_t *dst8 = (uint8_t *)dst;
+        for (size_t off = 0; off < total_bytes; off += chunk_bytes) {
+            size_t n = total_bytes - off;
+            if (n > chunk_bytes) n = chunk_bytes;
+            HIP_CHECK_I(hipMemcpy(dst8 + off, src8 + off, n, hipMemcpyHostToDevice));
+        }
+        return 0;
+    };
+
+    auto upload_matrix = [&](const void *src, int type, int M, int K,
+                             void **d_dst, int *d_type, size_t *d_bytes) -> int {
+        if (type == GGML_TYPE_BF16) {
+#ifdef QMOE_CUDA
+            *d_type = type;
+            *d_bytes = (size_t)M * (size_t)K * sizeof(uint16_t);
+            HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
+            return upload_bytes(src, *d_dst, *d_bytes);
+#else
+            if (!allow_fp_upcast) {
+                fprintf(stderr,
+                        "GPU: unsupported BF16 matrix for CUDA upload; rerun with QMOE_UPCAST_FP16=1 to upcast BF16 matrices on upload\n");
+                return -1;
+            }
+            size_t n = (size_t)M * (size_t)K;
+            float *tmp = (float *)malloc(n * sizeof(float));
+            if (!tmp) {
+                fprintf(stderr, "GPU: OOM converting %d x %d matrix type=%d to F32\n", M, K, type);
+                return -1;
+            }
+            const uint16_t *src16 = (const uint16_t *)src;
+            for (size_t i = 0; i < n; i++) {
+                uint32_t bits = (uint32_t)src16[i] << 16;
+                memcpy(&tmp[i], &bits, sizeof(float));
+            }
+            *d_type = GGML_TYPE_F32;
+            *d_bytes = n * sizeof(float);
+            HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
+            int rc = upload_bytes(tmp, *d_dst, *d_bytes);
+            free(tmp);
+            return rc;
+#endif
+        }
+
+        *d_type = type;
+        if (type == GGML_TYPE_F16) {
+            *d_bytes = (size_t)M * (size_t)K * sizeof(uint16_t);
+        } else if (type == GGML_TYPE_MXFP4_ID) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_MXFP4) * sizeof(block_mxfp4);
+        } else if (type == GGML_TYPE_Q8_0) {
+            *d_bytes = (size_t)M * ((size_t)K / QK8_0) * sizeof(block_q8_0);
+        } else if (type == GGML_TYPE_Q4_K) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_K) * sizeof(block_q4_K);
+        } else if (type == GGML_TYPE_Q5_K) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_K) * sizeof(block_q5_K);
+        } else if (type == GGML_TYPE_Q6_K) {
+            *d_bytes = (size_t)M * ((size_t)K / QK_K) * sizeof(block_q6_K);
+        } else {
+            *d_bytes = (size_t)M * (size_t)K * sizeof(float);
+        }
+        HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
+        return upload_bytes(src, *d_dst, *d_bytes);
+    };
 
     // --- Upload global weights ---
 
@@ -3770,6 +4143,7 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
         // Output norm
         {
             size_t sz = hp->n_embd * sizeof(float);
+            fprintf(stderr, "GPU:   upload output_norm (%.2f KB)\n", (double)sz / 1024.0);
             HIP_CHECK_I(hipMalloc(&ctx->d_output_norm, sz));
             HIP_CHECK_I(hipMemcpy(ctx->d_output_norm, m->output_norm, sz, hipMemcpyHostToDevice));
             total_uploaded += sz;
@@ -3777,32 +4151,33 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 
         // LM head (output weight)
         {
-            // output shape: [n_embd, vocab_size] => vocab_size rows of n_embd
-            size_t row_blocks = hp->n_embd / QK_K;
+            size_t total_bytes = m->output_size;
             ctx->output_type = m->output_type;
-            if (m->output_type == GGML_TYPE_Q4_K) {
-                ctx->output_row_bytes = row_blocks * sizeof(block_q4_K);
-            } else if (m->output_type == GGML_TYPE_Q6_K) {
-                ctx->output_row_bytes = row_blocks * sizeof(block_q6_K);
-            } else {
-                ctx->output_row_bytes = hp->n_embd * sizeof(float);
+#ifndef QMOE_CUDA
+            if (allow_fp_upcast && m->output_type == GGML_TYPE_BF16) {
+                ctx->output_type = GGML_TYPE_F32;
+                total_bytes = (size_t)hp->vocab_size * (size_t)hp->n_embd * sizeof(float);
             }
-            size_t total_bytes = (size_t)hp->vocab_size * ctx->output_row_bytes;
-            HIP_CHECK_I(hipMalloc(&ctx->d_output, total_bytes));
-            HIP_CHECK_I(hipMemcpy(ctx->d_output, m->output, total_bytes, hipMemcpyHostToDevice));
+#endif
+            ctx->output_row_bytes = total_bytes / hp->vocab_size;
+            fprintf(stderr, "GPU:   upload output_weight type=%d bytes=%.2f GB\n",
+                    ctx->output_type, (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+            size_t ignored = 0;
+            if (upload_matrix(m->output, m->output_type, hp->vocab_size, hp->n_embd,
+                              &ctx->d_output, &ctx->output_type, &ignored) != 0) return -1;
             total_uploaded += total_bytes;
         }
     } else {
         // Store type info for pingpong section to use
+#ifndef QMOE_CUDA
+        ctx->output_type = (allow_fp_upcast && m->output_type == GGML_TYPE_BF16)
+                         ? GGML_TYPE_F32 : m->output_type;
+#else
         ctx->output_type = m->output_type;
-        size_t row_blocks = hp->n_embd / QK_K;
-        if (m->output_type == GGML_TYPE_Q4_K) {
-            ctx->output_row_bytes = row_blocks * sizeof(block_q4_K);
-        } else if (m->output_type == GGML_TYPE_Q6_K) {
-            ctx->output_row_bytes = row_blocks * sizeof(block_q6_K);
-        } else {
-            ctx->output_row_bytes = hp->n_embd * sizeof(float);
-        }
+#endif
+        ctx->output_row_bytes = (ctx->output_type != m->output_type)
+                              ? (size_t)hp->n_embd * sizeof(float)
+                              : m->output_size / hp->vocab_size;
         ctx->d_output = nullptr;
         ctx->d_output_norm = nullptr;
     }
@@ -3811,38 +4186,17 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
     ctx->layers = (struct gpu_layer *)calloc(hp->n_layers, sizeof(struct gpu_layer));
     if (!ctx->layers) return -1;
 
-    // Helper: compute quantized weight size for M rows of K columns
-    auto calc_weight_size = [](int type, int M, int K) -> size_t {
-        if (type == GGML_TYPE_MXFP4_ID) {
-            int nb = K / QK_MXFP4;
-            return (size_t)M * nb * sizeof(block_mxfp4);
-        }
-        if (type == GGML_TYPE_Q8_0) {
-            int nb = K / QK8_0;
-            return (size_t)M * nb * sizeof(block_q8_0);
-        }
-        int nb = K / QK_K;
-        if (type == GGML_TYPE_Q4_K) return (size_t)M * nb * sizeof(block_q4_K);
-        if (type == GGML_TYPE_Q5_K) return (size_t)M * nb * sizeof(block_q5_K);
-        if (type == GGML_TYPE_Q6_K) return (size_t)M * nb * sizeof(block_q6_K);
-        return (size_t)M * K * sizeof(float);
-    };
-
     // Helper: upload a quantized weight matrix to GPU
     auto upload_weight = [&](void *src, int type, int M, int K,
                               void **d_dst, int *d_type, size_t *d_bytes) -> int {
-        *d_type = type;
-        *d_bytes = calc_weight_size(type, M, K);
-        HIP_CHECK_I(hipMalloc(d_dst, *d_bytes));
-        HIP_CHECK_I(hipMemcpy(*d_dst, src, *d_bytes, hipMemcpyHostToDevice));
-        return 0;
+        return upload_matrix(src, type, M, K, d_dst, d_type, d_bytes);
     };
 
     // Helper: upload f32 buffer
     auto upload_f32 = [&](const float *src, float **d_dst, size_t n) -> int {
         size_t sz = n * sizeof(float);
         HIP_CHECK_I(hipMalloc(d_dst, sz));
-        HIP_CHECK_I(hipMemcpy(*d_dst, src, sz, hipMemcpyHostToDevice));
+        if (upload_bytes(src, *d_dst, sz) != 0) return -1;
         return 0;
     };
 
@@ -3858,14 +4212,14 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
 
         // Common weights: attn_norm, ffn_norm, router
         HIP_CHECK_I(hipMalloc(&gl->d_attn_norm, norm_sz));
-        HIP_CHECK_I(hipMemcpy(gl->d_attn_norm, l->attn_norm, norm_sz, hipMemcpyHostToDevice));
+        if (upload_bytes(l->attn_norm, gl->d_attn_norm, norm_sz) != 0) return -1;
         HIP_CHECK_I(hipMalloc(&gl->d_ffn_norm, norm_sz));
-        HIP_CHECK_I(hipMemcpy(gl->d_ffn_norm, l->ffn_norm, norm_sz, hipMemcpyHostToDevice));
+        if (upload_bytes(l->ffn_norm, gl->d_ffn_norm, norm_sz) != 0) return -1;
         total_uploaded += 2 * norm_sz;
 
         size_t router_sz = (size_t)hp->n_experts * hp->n_embd * sizeof(float);
         HIP_CHECK_I(hipMalloc(&gl->d_router, router_sz));
-        HIP_CHECK_I(hipMemcpy(gl->d_router, l->router, router_sz, hipMemcpyHostToDevice));
+        if (upload_bytes(l->router, gl->d_router, router_sz) != 0) return -1;
         total_uploaded += router_sz;
 
         // Shared expert weights (all layers have these)
@@ -4314,12 +4668,18 @@ extern "C" int gpu_upload_model(gpu_ctx_t *ctx, const void *model_ptr) {
                 last_dc->output_row_bytes = row_blocks * sizeof(block_q4_K);
             } else if (m_pp->output_type == GGML_TYPE_Q6_K) {
                 last_dc->output_row_bytes = row_blocks * sizeof(block_q6_K);
+#ifndef QMOE_CUDA
+            } else if (allow_fp_upcast && m_pp->output_type == GGML_TYPE_BF16) {
+                last_dc->output_type = GGML_TYPE_F32;
+                last_dc->output_row_bytes = hp->n_embd * sizeof(float);
+#endif
             } else {
                 last_dc->output_row_bytes = hp->n_embd * sizeof(float);
             }
             size_t output_total = (size_t)hp->vocab_size * last_dc->output_row_bytes;
-            HIP_CHECK_I(hipMalloc(&last_dc->d_output, output_total));
-            HIP_CHECK_I(hipMemcpy(last_dc->d_output, m_pp->output, output_total, hipMemcpyHostToDevice));
+            size_t ignored = 0;
+            if (upload_matrix(m_pp->output, m_pp->output_type, hp->vocab_size, hp->n_embd,
+                              &last_dc->d_output, &last_dc->output_type, &ignored) != 0) return -1;
 
             // Logits buffer + pinned host
             HIP_CHECK_I(hipMalloc(&last_dc->d_logits, hp->vocab_size * sizeof(float)));
@@ -5225,18 +5585,20 @@ static bool consume_prefetch_nvme(gpu_ctx_t *ctx) {
         pf_vslots, pf_rslots, 32);
     uint64_t stride_pf = ctx->expert_stride;
     hipStream_t ts_pf = ctx->transfer_stream;
+    bool have_vram_cache = ctx->ecache.max_slots > 0 && ctx->ecache.d_buf != nullptr;
     for (int i = 0; i < n_nvme_h2d; i++) {
+        if (!have_vram_cache || pf_vslots[i] < 0 || pf_rslots[i] < 0) continue;
         (void)hipMemcpyAsync(
             (uint8_t *)ctx->ecache.d_buf + (size_t)pf_vslots[i] * stride_pf,
             (uint8_t *)ctx->rcache.buf + (size_t)pf_rslots[i] * stride_pf,
             stride_pf, hipMemcpyHostToDevice, ts_pf);
     }
-    if (n_nvme_h2d > 0) ctx->prof.spec_prefetched += n_nvme_h2d;
+    if (have_vram_cache && n_nvme_h2d > 0) ctx->prof.spec_prefetched += n_nvme_h2d;
     prefetch_mark_all_h2d_done(ctx->pf);
     prefetch_commit_ram_cache(ctx->pf, &ctx->rcache);
 
     int total_vpf = prefetch_vram_transfer_count(ctx->pf);
-    if (total_vpf > 0) {
+    if (have_vram_cache && total_vpf > 0) {
         (void)hipEventRecord(ctx->vram_prefetch_event, ctx->transfer_stream);
         ctx->vram_prefetch_active = true;
         ctx->prof.vram_prefetched += total_vpf;
@@ -5534,13 +5896,17 @@ static void *pp_spec_worker_fn(void *arg) {
         int n_to_pf = 0;
         // Device-local layer index for VRAM cache (cache uses n_layers=30)
         int next_cache_il = w->next_il / 2;
+        bool have_next_vram_cache = w->next_ec && w->next_ec->max_slots > 0 && w->next_ec->map;
 
         // Reset spec NVMe request list
         ctx->spec_nvme_n[w->next_il] = 0;
 
         for (int k = 0; k < w->n_pred; k++) {
             int eid = w->pred_ids[k];
-            int slot = w->next_ec->map[next_cache_il * w->next_ec->n_experts + eid];
+            int slot = -1;
+            if (have_next_vram_cache) {
+                slot = w->next_ec->map[next_cache_il * w->next_ec->n_experts + eid];
+            }
             if (slot >= 0) {
                 vram_cache_touch(w->next_ec, slot);
                 continue;
@@ -7167,7 +7533,9 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
             int pfa_vslots[32], pfa_rslots[32];
             int n_ram_h2d = prefetch_get_ram_transfers(ctx->pf,
                 pfa_vslots, pfa_rslots, 32);
+            bool have_vram_cache = ctx->ecache.max_slots > 0 && ctx->ecache.d_buf != nullptr;
             for (int i = 0; i < n_ram_h2d; i++) {
+                if (!have_vram_cache || pfa_vslots[i] < 0 || pfa_rslots[i] < 0) continue;
                 (void)hipMemcpyAsync(
                     (uint8_t *)ctx->ecache.d_buf + (size_t)pfa_vslots[i] * stride,
                     (uint8_t *)ctx->rcache.buf + (size_t)pfa_rslots[i] * stride,
@@ -7178,7 +7546,7 @@ extern "C" float *gpu_forward(gpu_ctx_t *ctx, void *model_ptr, int token_id, int
                 ctx->pf_pending = true;
             } else {
                 int total_vpf = prefetch_vram_transfer_count(ctx->pf);
-                if (total_vpf > 0) {
+                if (have_vram_cache && total_vpf > 0) {
                     prefetch_mark_all_h2d_done(ctx->pf);
                     (void)hipEventRecord(ctx->vram_prefetch_event, ts);
                     ctx->vram_prefetch_active = true;

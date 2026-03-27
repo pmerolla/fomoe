@@ -24,6 +24,7 @@ static void *read_tensor_data(gguf_ctx_t *ctx, const char *name, size_t *out_siz
         return NULL;
     }
     if (gguf_read_tensor(ctx, tid, data, ti->size) == 0) { free(data); return NULL; }
+
     if (out_size) *out_size = ti->size;
     if (out_type) *out_type = ti->type;
     return data;
@@ -238,9 +239,9 @@ model_t *model_load(const char *gguf_path, const char **store_paths, int n_store
 
     // ---- Load global weights ----
     fprintf(stderr, "Loading global weights...\n");
-    m->token_embd = read_tensor_data(ctx, "token_embd.weight", NULL, &m->token_embd_type);
+    m->token_embd = read_tensor_data(ctx, "token_embd.weight", &m->token_embd_size, &m->token_embd_type);
     m->output_norm = read_tensor_f32(ctx, "output_norm.weight");
-    m->output = read_tensor_data(ctx, "output.weight", NULL, &m->output_type);
+    m->output = read_tensor_data(ctx, "output.weight", &m->output_size, &m->output_type);
     if (!m->token_embd || !m->output_norm || !m->output) {
         fprintf(stderr, "model: failed to load global weights\n");
         model_free(m); return NULL;

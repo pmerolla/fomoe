@@ -170,7 +170,9 @@ int prefetch_classify_and_submit(
             if (rslot >= 0) {
                 e->src = PREFETCH_SRC_RAM;
                 e->ram_slot = rslot;
-                e->vram_slot = vram_cache_alloc_slot(vcache, next_layer, eid);
+                e->vram_slot = (vcache && vcache->max_slots > 0)
+                             ? vram_cache_alloc_slot(vcache, next_layer, eid)
+                             : -1;
                 ram_cache_touch(rcache, rslot);
                 e->nvme_complete = true;  // data in RAM, just needs H2D
                 ps->n_ram++;
@@ -188,7 +190,9 @@ int prefetch_classify_and_submit(
 
         e->src = PREFETCH_SRC_NVME;
         e->ram_slot = rcache ? ram_cache_alloc_slot(rcache, next_layer, eid) : -1;
-        e->vram_slot = vcache ? vram_cache_alloc_slot(vcache, next_layer, eid) : -1;
+        e->vram_slot = (vcache && vcache->max_slots > 0)
+                     ? vram_cache_alloc_slot(vcache, next_layer, eid)
+                     : -1;
 
         // Hide RAM slot from map until NVMe data is written.
         // Prevents main pipeline from seeing stale data as a RAM hit.
