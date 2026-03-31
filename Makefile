@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Iinclude -DQMOE_GPU
+CFLAGS = -O3 -march=native -fopenmp -Wall -Wextra -Wno-unused-parameter -Iinclude
 COMMON_LDFLAGS = -lm -lpthread -fopenmp
 QWEN_LDFLAGS = $(COMMON_LDFLAGS) -luring
 TEST_LDFLAGS = $(COMMON_LDFLAGS)
@@ -14,7 +14,7 @@ CUDA_ARCH ?= sm_80
 NVCC_FLAGS = -O2 -arch=$(CUDA_ARCH) -Iinclude -DFR_GPU -DFR_CUDA -DQMOE_GPU \
              --expt-relaxed-constexpr -Wno-deprecated-gpu-targets
 HIP_CFLAGS = $(NVCC_FLAGS)
-CFLAGS += -DFR_GPU -DFR_CUDA
+CFLAGS += -DQMOE_GPU -DFR_GPU -DFR_CUDA
 GPU_LDFLAGS = -L$(CUDA_PATH)/lib64 -lcudart
 LINKER = $(CC)
 HIPCC = $(NVCC)
@@ -23,7 +23,7 @@ else ifdef USE_GPU
 HIPCC ?= hipcc
 GPU_ARCH ?= $(shell command -v offload-arch >/dev/null 2>&1 && offload-arch 2>/dev/null | head -n 1 || echo gfx1200)
 HIP_CFLAGS = -O2 --offload-arch=$(GPU_ARCH) -Iinclude -DFR_GPU -DQMOE_GPU
-CFLAGS += -DFR_GPU
+CFLAGS += -DQMOE_GPU -DFR_GPU
 GPU_LDFLAGS = -lamdhip64
 LINKER = $(HIPCC)
 
@@ -39,9 +39,13 @@ C_SRCS = src/expert_cache.c src/freq_profile.c src/car.c src/expert_store.c \
          src/inference.c src/main.c
 C_OBJS = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(C_SRCS))
 
-# HIP/CUDA source files
+# HIP/CUDA source files (only when GPU enabled)
+ifneq (,$(or $(USE_CUDA),$(USE_GPU)))
 GPU_SRCS = src/gpu_kernels.hip src/tp.hip
 GPU_OBJS = $(patsubst src/%.hip,$(OBJ_DIR)/%.o,$(GPU_SRCS))
+else
+GPU_OBJS =
+endif
 
 .PHONY: all clean test_tp test_bw qwen-moe
 
